@@ -1,0 +1,392 @@
+"""
+Month-End Reconciliation Layer
+Builds an audit-ready reconciliation statement on top of reconcile().
+"""
+
+import numpy as np
+import pandas as pd
+
+TODAY = pd.Timestamp.today().normalize()
+
+
+# ---------------------------------------------------------------------------
+# Step 1 helpers – flatten each reconcile() output into a common schema
+# ---------------------------------------------------------------------------
+
+def _flatten_matched(df: pd.DataFrame, category: str) -> pd.DataFrame:
+    """Convert matched / near-matched pair rows into the unified flat format."""
+    if df.empty:
+        return pd.DataFrame()
+    rows = df.copy()
+    rows['category']      = category
+    rows['date']          = rows['bank_date']
+    rows['amount']        = rows['bank_amount']
+    rows['reference']     = rows['bank_reference']
+    rows['description']   = rows['bank_description']
+    rows['date_diff_days'] = (rows['bank_date'] - rows['ledger_date']).abs().dt.days
+    return rows
+
+
+def _detect_special_categories(df: pd.DataFrame, base_category: str) -> pd.DataFrame:
+    """
+    Within an unmatched DataFrame, promote rows to DUPLICATE or REVERSAL
+    before falling back to the given base_category.
+    """
+    df = df.copy().reset_index(drop=True)
+    df['category'] = base_category
+
+    # --- Duplicate detection: same reference more than once ---
+    ref_counts = df['reference'].value_counts()
+    dup_refs = ref_counts[ref_counts > 1].index
+    df.loc[df['reference'].isin(dup_refs), 'category'] = 'DUPLICATE'
+
+    # --- Reversal detection: opposite amounts within 3 days ---
+    candidates = df[df['category'] == base_category]
+    idxs = candidates.index.tolist()
+    reversal_idx: set = set()
+    for i in range(len(idxs)):
+        for j in range(i + 1, len(idxs)):
+            r1, r2 = df.loc[idxs[i]], df.loc[idxs[j]]
+            if (
+                not pd.isna(r1['amount']) and not pd.isna(r2['amount'])
+                and r1['amount'] + r2['amount'] == 0
+                and not pd.isna(r1['date']) and not pd.isna(r2['date'])
+                and abs((r1['date'] - r2['date']).days) <= 3
+            ):
+                reversal_idx.update([idxs[i], idxs[j]])
+    df.loc[list(reversal_idx), 'category'] = 'REVERSAL'
+
+    return df
+
+
+def _flatten_unmatched(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Standardise an unmatched_bank / unmatched_ledger frame into unified format."""
+    if df.empty:
+        return pd.DataFrame()
+
+    tagged = _detect_special_categories(df.copy(), source)
+
+    is_bank   = source == 'BANK_ONLY_ENTRY'
+    is_ledger = source == 'LEDGER_ONLY_ENTRY'
+
+    tagged['bank_date']          = tagged['date']        if is_bank   else pd.NaT
+    tagged['bank_amount']        = tagged['amount']      if is_bank   else np.nan
+    tagged['bank_reference']     = tagged['reference']   if is_bank   else ''
+    tagged['bank_description']   = tagged['description'] if is_bank   else ''
+    tagged['ledger_date']        = tagged['date']        if is_ledger else pd.NaT
+    tagged['ledger_amount']      = tagged['amount']      if is_ledger else np.nan
+    tagged['ledger_reference']   = tagged['reference']   if is_ledger else ''
+    tagged['ledger_description'] = tagged['description'] if is_ledger else ''
+    tagged['confidence']         = np.nan
+    tagged['match_type']         = ''
+    tagged['date_diff_days']     = np.nan
+
+    return tagged
+
+
+# ---------------------------------------------------------------------------
+# Step 2 – status assignment
+# ---------------------------------------------------------------------------
+
+def _assign_status(row: pd.Series) -> str:
+    cat  = row['category']
+    desc = str(row.get('description', '')).upper()
+
+    if cat == 'MATCHED':
+        return 'CLEARED'
+
+    if cat == 'NEAR_MATCH':
+        diff = row.get('date_diff_days', 0)
+        diff = 0 if pd.isna(diff) else int(diff)
+        return 'LIKELY_CLEARED' if diff <= 3 else 'REVIEW'
+
+    if cat == 'BANK_ONLY_ENTRY':
+        if any(kw in desc for kw in ('CHARGE', 'FEE', 'GST', 'INTEREST')):
+            return 'ADJUSTMENT_REQUIRED'
+        return 'UNRECORDED_RECEIPT'
+
+    if cat == 'LEDGER_ONLY_ENTRY':
+        return 'PAYMENT_NOT_PROCESSED'
+
+    if cat == 'REVERSAL':
+        return 'REVERSAL_ENTRY'
+
+    if cat == 'DUPLICATE':
+        return 'ERROR_DUPLICATE'
+
+    return 'REVIEW'
+
+
+# ---------------------------------------------------------------------------
+# Step 3 – aging
+# ---------------------------------------------------------------------------
+
+def _aging_bucket(days) -> str:
+    if pd.isna(days):
+        return 'UNKNOWN'
+    days = int(days)
+    if days <= 3:
+        return 'CURRENT'
+    if days <= 10:
+        return 'SHORT_DELAY'
+    return 'OLD'
+
+
+# ---------------------------------------------------------------------------
+# Step 5 – suggested journal entries
+# ---------------------------------------------------------------------------
+
+def _suggested_entry(row: pd.Series) -> str:
+    cat    = row['category']
+    desc   = str(row.get('description', '')).upper()
+    status = row.get('status', '')
+
+    if cat == 'BANK_ONLY_ENTRY':
+        if any(kw in desc for kw in ('CHARGE', 'FEE', 'GST')):
+            return 'Dr Bank Charges A/c / Cr Bank A/c'
+        if 'INTEREST' in desc:
+            return 'Dr Bank A/c / Cr Interest Income A/c'
+        return 'Record receipt in ledger'
+
+    if cat == 'NEAR_MATCH' and status == 'REVIEW':
+        return 'Post difference adjustment'
+
+    if cat == 'LEDGER_ONLY_ENTRY':
+        return 'Check payment run / reverse entry'
+
+    if cat == 'REVERSAL':
+        return 'Verify reversal and post correcting entry'
+
+    if cat == 'DUPLICATE':
+        return 'Investigate and remove duplicate posting'
+
+    return ''
+
+
+# ---------------------------------------------------------------------------
+# Remarks
+# ---------------------------------------------------------------------------
+
+def _build_remarks(row: pd.Series) -> str:
+    cat = row['category']
+
+    if cat == 'MATCHED':
+        return f"Exact match | Ref: {row.get('bank_reference', '')}"
+
+    if cat == 'NEAR_MATCH':
+        diff = row.get('date_diff_days', 0)
+        diff = 0 if pd.isna(diff) else int(diff)
+        conf = row.get('confidence', 0) or 0
+        return f"Near match | {diff} day(s) date diff | Confidence: {conf:.0%}"
+
+    if cat == 'BANK_ONLY_ENTRY':
+        return 'Bank entry with no ledger counterpart'
+
+    if cat == 'LEDGER_ONLY_ENTRY':
+        return 'Ledger entry not yet cleared by bank'
+
+    if cat == 'REVERSAL':
+        return 'Possible reversal pair – verify before posting'
+
+    if cat == 'DUPLICATE':
+        return 'Duplicate reference – investigate posting'
+
+    return ''
+
+
+# ---------------------------------------------------------------------------
+# Step 1 – main view builder
+# ---------------------------------------------------------------------------
+
+_FINAL_COLS = [
+    'category', 'status',
+    'date', 'amount', 'reference', 'description',
+    'bank_date', 'bank_amount', 'bank_reference', 'bank_description',
+    'ledger_date', 'ledger_amount', 'ledger_reference', 'ledger_description',
+    'confidence', 'match_type', 'date_diff_days',
+    'aging_days', 'aging_bucket',
+    'remarks', 'suggested_entry',
+]
+
+
+def prepare_month_end_view(result: dict) -> pd.DataFrame:
+    """
+    Combine all reconcile() outputs into one audit-ready DataFrame.
+
+    Added columns
+    -------------
+    category       : MATCHED | NEAR_MATCH | BANK_ONLY_ENTRY | LEDGER_ONLY_ENTRY
+                     | REVERSAL | DUPLICATE
+    status         : CLEARED | LIKELY_CLEARED | REVIEW | ADJUSTMENT_REQUIRED
+                     | UNRECORDED_RECEIPT | PAYMENT_NOT_PROCESSED
+                     | REVERSAL_ENTRY | ERROR_DUPLICATE
+    aging_days     : calendar days since transaction date (as of today)
+    aging_bucket   : CURRENT (0–3) | SHORT_DELAY (4–10) | OLD (10+)
+    remarks        : human-readable explanation
+    suggested_entry: proposed journal entry where applicable
+    """
+    parts = []
+
+    if not result['matched'].empty:
+        parts.append(_flatten_matched(result['matched'], 'MATCHED'))
+
+    if not result['near_matched'].empty:
+        parts.append(_flatten_matched(result['near_matched'], 'NEAR_MATCH'))
+
+    if not result['unmatched_bank'].empty:
+        parts.append(_flatten_unmatched(result['unmatched_bank'], 'BANK_ONLY_ENTRY'))
+
+    if not result['unmatched_ledger'].empty:
+        parts.append(_flatten_unmatched(result['unmatched_ledger'], 'LEDGER_ONLY_ENTRY'))
+
+    if not parts:
+        return pd.DataFrame(columns=_FINAL_COLS)
+
+    df = pd.concat(parts, ignore_index=True)
+
+    # Step 2 – status
+    df['status'] = df.apply(_assign_status, axis=1)
+
+    # Step 3 – aging
+    df['aging_days']   = (TODAY - df['date']).dt.days.clip(lower=0).fillna(0).astype(int)
+    df['aging_bucket'] = df['aging_days'].apply(_aging_bucket)
+
+    # Remarks & suggested entries
+    df['remarks']        = df.apply(_build_remarks, axis=1)
+    df['suggested_entry'] = df.apply(_suggested_entry, axis=1)
+
+    return df[[c for c in _FINAL_COLS if c in df.columns]]
+
+
+# ---------------------------------------------------------------------------
+# Step 4 – carry-forward
+# ---------------------------------------------------------------------------
+
+def _build_carry_forward(recon_table: pd.DataFrame) -> pd.DataFrame:
+    """All non-CLEARED items become next month's opening recon items."""
+    cf = recon_table[recon_table['status'] != 'CLEARED'].copy()
+    cf = cf.reset_index(drop=True)
+    cf.insert(0, 'carry_forward_reason', cf['status'])
+    return cf
+
+
+# ---------------------------------------------------------------------------
+# Step 6 – audit-ready summary
+# ---------------------------------------------------------------------------
+
+def _build_audit_summary(result: dict, recon_table: pd.DataFrame,
+                         opening_ledger_balance: float) -> dict:
+    raw = result['summary']
+
+    matched_amt      = result['matched']['bank_amount'].sum()      if not result['matched'].empty      else 0.0
+    near_matched_amt = result['near_matched']['bank_amount'].sum() if not result['near_matched'].empty else 0.0
+    unmatched_bank_amt   = result['unmatched_bank']['amount'].sum()   if not result['unmatched_bank'].empty   else 0.0
+    unmatched_ledger_amt = result['unmatched_ledger']['amount'].sum() if not result['unmatched_ledger'].empty else 0.0
+
+    adj_mask = recon_table['status'] == 'ADJUSTMENT_REQUIRED'
+    total_adj = recon_table.loc[adj_mask, 'amount'].sum()
+
+    status_counts = recon_table['status'].value_counts().to_dict()
+
+    return {
+        # Balances
+        'opening_balance_ledger':       round(opening_ledger_balance, 2),
+        'closing_balance_bank':         round(raw['bank_total'], 2),
+        'closing_balance_ledger':       round(raw['ledger_total'], 2),
+        'difference_bank_vs_ledger':    round(raw['difference'], 2),
+        # Match breakdown – amounts
+        'total_matched_amount':         round(matched_amt, 2),
+        'total_near_matched_amount':    round(near_matched_amt, 2),
+        'total_unmatched_bank_amount':  round(unmatched_bank_amt, 2),
+        'total_unmatched_ledger_amount': round(unmatched_ledger_amt, 2),
+        'total_adjustments_required':   round(total_adj, 2),
+        # Match breakdown – counts
+        'count_bank_transactions':      raw['total_bank'],
+        'count_ledger_entries':         raw['total_ledger'],
+        'count_exact_matches':          raw['exact_matches'],
+        'count_near_matches':           raw['near_matches'],
+        'count_unmatched_bank':         raw['unmatched_bank'],
+        'count_unmatched_ledger':       raw['unmatched_ledger'],
+        'match_rate_pct':               raw['match_rate'],
+        # Status distribution
+        **{f'status_{k.lower()}': v for k, v in status_counts.items()},
+        # Meta
+        'recon_date': TODAY.strftime('%Y-%m-%d'),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 7 – master export function
+# ---------------------------------------------------------------------------
+
+def generate_month_end_recon(result: dict,
+                             opening_ledger_balance: float = 0.0) -> dict:
+    """
+    Master month-end reconciliation function.
+
+    Parameters
+    ----------
+    result                  : dict returned by reconcile()
+    opening_ledger_balance  : ledger balance at the start of the period
+
+    Returns
+    -------
+    {
+        "recon_table"  : pd.DataFrame  – full reconciliation view
+        "carry_forward": pd.DataFrame  – items not yet cleared (next-month opening)
+        "summary"      : dict          – audit-ready numeric summary
+    }
+    """
+    recon_table    = prepare_month_end_view(result)
+    carry_forward  = _build_carry_forward(recon_table)
+    summary        = _build_audit_summary(result, recon_table, opening_ledger_balance)
+
+    return {
+        'recon_table':   recon_table,
+        'carry_forward': carry_forward,
+        'summary':       summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Excel export helper
+# ---------------------------------------------------------------------------
+
+def export_to_excel(month_end_result: dict, filepath: str) -> None:
+    """
+    Write the month-end reconciliation to a formatted Excel workbook.
+
+    Sheets
+    ------
+    Recon Statement   – full recon_table
+    Carry Forward     – items to open next month
+    Summary           – audit summary as key/value pairs
+    """
+    recon_table  = month_end_result['recon_table']
+    carry_forward = month_end_result['carry_forward']
+    summary      = month_end_result['summary']
+
+    summary_df = pd.DataFrame(
+        list(summary.items()), columns=['Metric', 'Value']
+    )
+
+    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+        recon_table.to_excel(writer,   sheet_name='Recon Statement', index=False)
+        carry_forward.to_excel(writer, sheet_name='Carry Forward',   index=False)
+        summary_df.to_excel(writer,    sheet_name='Summary',         index=False)
+
+        # Auto-fit column widths
+        for sheet_name, df in [
+            ('Recon Statement', recon_table),
+            ('Carry Forward',   carry_forward),
+            ('Summary',         summary_df),
+        ]:
+            ws = writer.sheets[sheet_name]
+            for col_idx, col in enumerate(df.columns, start=1):
+                max_len = max(
+                    len(str(col)),
+                    df[col].astype(str).str.len().max() if not df.empty else 0
+                )
+                ws.column_dimensions[
+                    ws.cell(row=1, column=col_idx).column_letter
+                ].width = min(max_len + 2, 50)
