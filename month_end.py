@@ -19,11 +19,15 @@ def _flatten_matched(df: pd.DataFrame, category: str) -> pd.DataFrame:
         return pd.DataFrame()
     rows = df.copy()
     rows['category']      = category
-    rows['date']          = rows['bank_date']
-    rows['amount']        = rows['bank_amount']
-    rows['reference']     = rows['bank_reference']
-    rows['description']   = rows['bank_description']
-    rows['date_diff_days'] = (rows['bank_date'] - rows['ledger_date']).abs().dt.days
+    rows['date']          = pd.to_datetime(rows['bank_date'], errors='coerce')
+    rows['amount']        = pd.to_numeric(rows['bank_amount'], errors='coerce')
+    rows['reference']     = rows['bank_reference'].astype(str)
+    rows['description']   = rows['bank_description'].astype(str)
+    rows['date_diff_days'] = (
+        (pd.to_datetime(rows['bank_date'], errors='coerce')
+         - pd.to_datetime(rows['ledger_date'], errors='coerce'))
+        .abs().dt.days
+    )
     return rows
 
 
@@ -84,6 +88,20 @@ def _flatten_unmatched(df: pd.DataFrame, source: str) -> pd.DataFrame:
     return tagged
 
 
+def _flatten_composite(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten composite match rows into unified format."""
+    if df.empty:
+        return pd.DataFrame()
+    rows = df.copy()
+    rows['category']       = 'COMPOSITE'
+    rows['date']           = pd.to_datetime(rows['bank_date'], errors='coerce')
+    rows['amount']         = pd.to_numeric(rows['bank_amount'], errors='coerce')
+    rows['reference']      = rows['bank_reference'].astype(str)
+    rows['description']    = rows['bank_description'].astype(str)
+    rows['date_diff_days'] = 0
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Step 2 – status assignment
 # ---------------------------------------------------------------------------
@@ -94,6 +112,9 @@ def _assign_status(row: pd.Series) -> str:
 
     if cat == 'MATCHED':
         return 'CLEARED'
+
+    if cat == 'COMPOSITE':
+        return 'COMPOSITE_CLEARED'
 
     if cat == 'NEAR_MATCH':
         diff = row.get('date_diff_days', 0)
@@ -141,6 +162,9 @@ def _suggested_entry(row: pd.Series) -> str:
     desc   = str(row.get('description', '')).upper()
     status = row.get('status', '')
 
+    if cat in ('MATCHED', 'COMPOSITE'):
+        return ''
+
     if cat == 'BANK_ONLY_ENTRY':
         if any(kw in desc for kw in ('CHARGE', 'FEE', 'GST')):
             return 'Dr Bank Charges A/c / Cr Bank A/c'
@@ -172,6 +196,10 @@ def _build_remarks(row: pd.Series) -> str:
 
     if cat == 'MATCHED':
         return f"Exact match | Ref: {row.get('bank_reference', '')}"
+
+    if cat == 'COMPOSITE':
+        return f"Composite match | Type: {row.get('match_type', '')} | " \
+               f"Refs: {str(row.get('bank_reference', ''))[:60]}"
 
     if cat == 'NEAR_MATCH':
         diff = row.get('date_diff_days', 0)
@@ -212,18 +240,6 @@ _FINAL_COLS = [
 def prepare_month_end_view(result: dict) -> pd.DataFrame:
     """
     Combine all reconcile() outputs into one audit-ready DataFrame.
-
-    Added columns
-    -------------
-    category       : MATCHED | NEAR_MATCH | BANK_ONLY_ENTRY | LEDGER_ONLY_ENTRY
-                     | REVERSAL | DUPLICATE
-    status         : CLEARED | LIKELY_CLEARED | REVIEW | ADJUSTMENT_REQUIRED
-                     | UNRECORDED_RECEIPT | PAYMENT_NOT_PROCESSED
-                     | REVERSAL_ENTRY | ERROR_DUPLICATE
-    aging_days     : calendar days since transaction date (as of today)
-    aging_bucket   : CURRENT (0–3) | SHORT_DELAY (4–10) | OLD (10+)
-    remarks        : human-readable explanation
-    suggested_entry: proposed journal entry where applicable
     """
     parts = []
 
@@ -232,6 +248,10 @@ def prepare_month_end_view(result: dict) -> pd.DataFrame:
 
     if not result['near_matched'].empty:
         parts.append(_flatten_matched(result['near_matched'], 'NEAR_MATCH'))
+
+    # Composite matches (new)
+    if not result.get('composite', pd.DataFrame()).empty:
+        parts.append(_flatten_composite(result['composite']))
 
     if not result['unmatched_bank'].empty:
         parts.append(_flatten_unmatched(result['unmatched_bank'], 'BANK_ONLY_ENTRY'))
@@ -244,14 +264,11 @@ def prepare_month_end_view(result: dict) -> pd.DataFrame:
 
     df = pd.concat(parts, ignore_index=True)
 
-    # Step 2 – status
     df['status'] = df.apply(_assign_status, axis=1)
 
-    # Step 3 – aging
     df['aging_days']   = (TODAY - df['date']).dt.days.clip(lower=0).fillna(0).astype(int)
     df['aging_bucket'] = df['aging_days'].apply(_aging_bucket)
 
-    # Remarks & suggested entries
     df['remarks']        = df.apply(_build_remarks, axis=1)
     df['suggested_entry'] = df.apply(_suggested_entry, axis=1)
 
@@ -263,8 +280,8 @@ def prepare_month_end_view(result: dict) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _build_carry_forward(recon_table: pd.DataFrame) -> pd.DataFrame:
-    """All non-CLEARED items become next month's opening recon items."""
-    cf = recon_table[recon_table['status'] != 'CLEARED'].copy()
+    """All non-CLEARED / non-COMPOSITE_CLEARED items become next month's opening items."""
+    cf = recon_table[~recon_table['status'].isin(['CLEARED', 'COMPOSITE_CLEARED'])].copy()
     cf = cf.reset_index(drop=True)
     cf.insert(0, 'carry_forward_reason', cf['status'])
     return cf
@@ -280,37 +297,35 @@ def _build_audit_summary(result: dict, recon_table: pd.DataFrame,
 
     matched_amt      = result['matched']['bank_amount'].sum()      if not result['matched'].empty      else 0.0
     near_matched_amt = result['near_matched']['bank_amount'].sum() if not result['near_matched'].empty else 0.0
+    composite_amt    = (pd.to_numeric(result['composite']['bank_amount'], errors='coerce').sum()
+                        if not result.get('composite', pd.DataFrame()).empty else 0.0)
     unmatched_bank_amt   = result['unmatched_bank']['amount'].sum()   if not result['unmatched_bank'].empty   else 0.0
     unmatched_ledger_amt = result['unmatched_ledger']['amount'].sum() if not result['unmatched_ledger'].empty else 0.0
 
-    adj_mask = recon_table['status'] == 'ADJUSTMENT_REQUIRED'
-    total_adj = recon_table.loc[adj_mask, 'amount'].sum()
-
+    adj_mask   = recon_table['status'] == 'ADJUSTMENT_REQUIRED'
+    total_adj  = recon_table.loc[adj_mask, 'amount'].sum()
     status_counts = recon_table['status'].value_counts().to_dict()
 
     return {
-        # Balances
-        'opening_balance_ledger':       round(opening_ledger_balance, 2),
-        'closing_balance_bank':         round(raw['bank_total'], 2),
-        'closing_balance_ledger':       round(raw['ledger_total'], 2),
-        'difference_bank_vs_ledger':    round(raw['difference'], 2),
-        # Match breakdown – amounts
-        'total_matched_amount':         round(matched_amt, 2),
-        'total_near_matched_amount':    round(near_matched_amt, 2),
-        'total_unmatched_bank_amount':  round(unmatched_bank_amt, 2),
+        'opening_balance_ledger':        round(opening_ledger_balance, 2),
+        'closing_balance_bank':          round(raw['bank_total'], 2),
+        'closing_balance_ledger':        round(raw['ledger_total'], 2),
+        'difference_bank_vs_ledger':     round(raw['difference'], 2),
+        'total_matched_amount':          round(matched_amt, 2),
+        'total_near_matched_amount':     round(near_matched_amt, 2),
+        'total_composite_amount':        round(composite_amt, 2),
+        'total_unmatched_bank_amount':   round(unmatched_bank_amt, 2),
         'total_unmatched_ledger_amount': round(unmatched_ledger_amt, 2),
-        'total_adjustments_required':   round(total_adj, 2),
-        # Match breakdown – counts
-        'count_bank_transactions':      raw['total_bank'],
-        'count_ledger_entries':         raw['total_ledger'],
-        'count_exact_matches':          raw['exact_matches'],
-        'count_near_matches':           raw['near_matches'],
-        'count_unmatched_bank':         raw['unmatched_bank'],
-        'count_unmatched_ledger':       raw['unmatched_ledger'],
-        'match_rate_pct':               raw['match_rate'],
-        # Status distribution
+        'total_adjustments_required':    round(total_adj, 2),
+        'count_bank_transactions':       raw['total_bank'],
+        'count_ledger_entries':          raw['total_ledger'],
+        'count_exact_matches':           raw['exact_matches'],
+        'count_near_matches':            raw['near_matches'],
+        'count_composite_matches':       raw.get('composite_matches', 0),
+        'count_unmatched_bank':          raw['unmatched_bank'],
+        'count_unmatched_ledger':        raw['unmatched_ledger'],
+        'match_rate_pct':                raw['match_rate'],
         **{f'status_{k.lower()}': v for k, v in status_counts.items()},
-        # Meta
         'recon_date': TODAY.strftime('%Y-%m-%d'),
     }
 
@@ -320,26 +335,26 @@ def _build_audit_summary(result: dict, recon_table: pd.DataFrame,
 # ---------------------------------------------------------------------------
 
 def generate_month_end_recon(result: dict,
-                             opening_ledger_balance: float = 0.0) -> dict:
+                              opening_ledger_balance: float = 0.0) -> dict:
     """
     Master month-end reconciliation function.
 
     Parameters
     ----------
-    result                  : dict returned by reconcile()
-    opening_ledger_balance  : ledger balance at the start of the period
+    result                 : dict returned by reconcile()
+    opening_ledger_balance : ledger balance at the start of the period
 
     Returns
     -------
     {
-        "recon_table"  : pd.DataFrame  – full reconciliation view
-        "carry_forward": pd.DataFrame  – items not yet cleared (next-month opening)
-        "summary"      : dict          – audit-ready numeric summary
+        'recon_table'  : pd.DataFrame
+        'carry_forward': pd.DataFrame
+        'summary'      : dict
     }
     """
-    recon_table    = prepare_month_end_view(result)
-    carry_forward  = _build_carry_forward(recon_table)
-    summary        = _build_audit_summary(result, recon_table, opening_ledger_balance)
+    recon_table   = prepare_month_end_view(result)
+    carry_forward = _build_carry_forward(recon_table)
+    summary       = _build_audit_summary(result, recon_table, opening_ledger_balance)
 
     return {
         'recon_table':   recon_table,
@@ -353,29 +368,18 @@ def generate_month_end_recon(result: dict,
 # ---------------------------------------------------------------------------
 
 def export_to_excel(month_end_result: dict, filepath: str) -> None:
-    """
-    Write the month-end reconciliation to a formatted Excel workbook.
-
-    Sheets
-    ------
-    Recon Statement   – full recon_table
-    Carry Forward     – items to open next month
-    Summary           – audit summary as key/value pairs
-    """
-    recon_table  = month_end_result['recon_table']
+    """Write the month-end reconciliation to a formatted Excel workbook."""
+    recon_table   = month_end_result['recon_table']
     carry_forward = month_end_result['carry_forward']
-    summary      = month_end_result['summary']
+    summary       = month_end_result['summary']
 
-    summary_df = pd.DataFrame(
-        list(summary.items()), columns=['Metric', 'Value']
-    )
+    summary_df = pd.DataFrame(list(summary.items()), columns=['Metric', 'Value'])
 
     with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
         recon_table.to_excel(writer,   sheet_name='Recon Statement', index=False)
         carry_forward.to_excel(writer, sheet_name='Carry Forward',   index=False)
         summary_df.to_excel(writer,    sheet_name='Summary',         index=False)
 
-        # Auto-fit column widths
         for sheet_name, df in [
             ('Recon Statement', recon_table),
             ('Carry Forward',   carry_forward),

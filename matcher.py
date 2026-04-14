@@ -1,236 +1,523 @@
 """
-Bank Reconciliation Matching Engine - Phase 1
-Matches bank transactions against ledger entries using multiple parameters.
+XBP LedgerSync — Matching Engine
+Reconciles bank transactions against ledger entries using 4 passes:
+
+  Pass 1  — Exact / high-confidence 1-to-1
+  Pass 2  — Near-match 1-to-1
+  Pass 3  — Composite 1-to-N  (one bank entry = sum of N ledger entries)
+  Pass 4  — Composite N-to-1  (N bank entries = one ledger entry)
+
+Additional features:
+  • Multi-currency: amounts normalised to base currency before comparison
+  • Account-level matching: account numbers used as a confidence signal
+  • Separate debit/credit column support (pre-processed in app before calling here)
+  • Absolute + percentage amount tolerance
 """
 
 import pandas as pd
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import combinations
+from typing import Dict
 
+
+# ─── Date parsing ─────────────────────────────────────────────────────────────
 
 def _parse_dates(series: pd.Series) -> pd.Series:
-    """
-    Parse dates robustly.
-    Tries ISO8601 (YYYY-MM-DD) first; falls back to mixed/dayfirst
-    for DD-MM-YYYY input if the ISO pass yields mostly NaT.
-    """
     parsed = pd.to_datetime(series, format='ISO8601', errors='coerce')
     if parsed.isna().mean() > 0.5 and series.notna().any():
         parsed = pd.to_datetime(series, format='mixed', dayfirst=True, errors='coerce')
     return parsed
 
 
+# ─── Config ───────────────────────────────────────────────────────────────────
+
 @dataclass
 class MatchConfig:
-    """Configuration for matching tolerances."""
-    date_tolerance_days: int = 3          # days of slack allowed
-    amount_tolerance_pct: float = 0.0     # 0 = exact amount match required
-    reference_weight: float = 0.4
-    amount_weight: float = 0.35
-    date_weight: float = 0.25
+    """Configuration for matching tolerances and feature flags."""
+
+    # 1-to-1 matching
+    date_tolerance_days: int   = 3
+    amount_tolerance_pct: float = 0.0    # fraction, e.g. 0.01 = 1 %
+    amount_tolerance_abs: float = 0.01   # absolute floor (handles rounding)
+    reference_weight: float    = 0.40
+    amount_weight: float       = 0.35
+    date_weight: float         = 0.25
+
+    # Account matching (auto-enabled when account column present)
+    account_weight: float = 0.0
+
+    # Currency
+    base_currency: str = 'INR'
+    fx_rates: Dict[str, float] = field(default_factory=dict)  # {'USD': 84.5, …}
+
+    # Composite matching
+    composite_match: bool        = True
+    composite_max_items: int     = 5    # max items in one composite group
+    composite_date_slack: int    = 14   # days window for composite candidates
 
 
-def standardize_bank(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize bank statement columns to internal format."""
-    df = df.copy()
-    df.columns = df.columns.str.strip().str.lower()
+# ─── Currency helpers ─────────────────────────────────────────────────────────
 
-    # Map common column name variants
-    col_map = {
-        'txn_date': 'date', 'transaction_date': 'date', 'value_date': 'date',
-        'narration': 'description', 'particulars': 'description', 'remarks': 'description',
-        'reference': 'reference', 'ref_no': 'reference', 'utr': 'reference',
-        'amount': 'amount', 'debit': 'amount', 'withdrawal': 'amount',
-    }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-    df['date'] = _parse_dates(df['date'])
-    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-    df['reference'] = df['reference'].astype(str).str.strip().str.upper()
-    df['description'] = (df['description'] if 'description' in df.columns else pd.Series([''] * len(df), index=df.index)).astype(str).str.strip().str.upper()
-    df['source'] = 'BANK'
-    df['original_index'] = df.index
-    return df
+def _to_base(amount: float, currency, config: MatchConfig) -> float:
+    """Convert amount to base currency using config.fx_rates."""
+    if pd.isna(amount):
+        return float('nan')
+    if not currency or pd.isna(currency) or not config.fx_rates:
+        return float(amount)
+    ccy  = str(currency).strip().upper()
+    base = config.base_currency.strip().upper()
+    if ccy == base:
+        return float(amount)
+    rate = config.fx_rates.get(ccy)
+    if rate and rate > 0:
+        return float(amount) * float(rate)
+    return float(amount)   # unknown currency → use as-is
 
 
-def standardize_ledger(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize ledger/cashbook columns to internal format."""
-    df = df.copy()
-    df.columns = df.columns.str.strip().str.lower()
-
-    col_map = {
-        'entry_date': 'date', 'posting_date': 'date', 'doc_date': 'date',
-        'voucher_no': 'reference', 'document_no': 'reference', 'ref': 'reference',
-        'party_name': 'description', 'vendor': 'description', 'payee': 'description',
-        'amount': 'amount', 'net_amount': 'amount',
-    }
-    # Only rename cols whose target does not already exist, to avoid duplicate column names.
-    safe_rename = {
-        k: v for k, v in col_map.items()
-        if k in df.columns and v not in df.columns
-    }
-    df = df.rename(columns=safe_rename)
-    df['date'] = _parse_dates(df['date'])
-    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-    df['reference'] = df['reference'].astype(str).str.strip().str.upper()
-    desc_col = df['description'] if 'description' in df.columns else pd.Series([''] * len(df), index=df.index)
-    df['description'] = desc_col.astype(str).str.strip().str.upper()
-    df['source'] = 'LEDGER'
-    df['original_index'] = df.index
-    return df
-
+# ─── Scoring helpers ──────────────────────────────────────────────────────────
 
 def _ref_similarity(ref1: str, ref2: str) -> float:
-    """Check if references match. Returns 1.0 for exact, 0.5 for partial, 0.0 for no match."""
+    """1.0 = exact, 0.5 = substring, 0.0 = no match."""
     if ref1 == ref2:
         return 1.0
-    # Check if one contains the other (partial reference match)
     if ref1 in ref2 or ref2 in ref1:
         return 0.5
     return 0.0
 
 
 def _date_score(date1, date2, tolerance_days: int) -> float:
-    """Score date proximity. 1.0 = same day, 0.0 = beyond tolerance."""
+    """1.0 = same day, decays linearly to 0.0 at tolerance boundary."""
     if pd.isna(date1) or pd.isna(date2):
         return 0.0
     diff = abs((date1 - date2).days)
     if diff == 0:
         return 1.0
-    elif diff <= tolerance_days:
+    if diff <= tolerance_days:
         return 1.0 - (diff / (tolerance_days + 1))
     return 0.0
 
 
-def _amount_matches(amt1: float, amt2: float, tolerance_pct: float) -> bool:
-    """Check if amounts match within tolerance."""
-    if pd.isna(amt1) or pd.isna(amt2):
-        return False
-    if tolerance_pct == 0:
-        return amt1 == amt2
-    return abs(amt1 - amt2) <= abs(amt1) * tolerance_pct
-
-
-def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame, config: MatchConfig = None) -> dict:
+def _account_score(acc1, acc2) -> float:
     """
-    Main reconciliation function.
-    
-    Returns dict with:
-        - matched: DataFrame of exact matches (confidence >= 0.85)
-        - near_matched: DataFrame of probable matches (0.50 <= confidence < 0.85)
-        - unmatched_bank: DataFrame of bank items with no match
-        - unmatched_ledger: DataFrame of ledger items with no match
-        - summary: dict with counts and totals
+    1.0  = exact match
+    0.7  = last-4-digits match (partial account number)
+    0.5  = one or both unknown (neutral — don't penalise)
+    0.0  = different accounts (block match when account_weight > 0)
+    """
+    if acc1 is None or acc2 is None:
+        return 0.5
+    a1 = str(acc1).strip().upper()
+    a2 = str(acc2).strip().upper()
+    if a1 in ('NONE', 'NAN', '') or a2 in ('NONE', 'NAN', ''):
+        return 0.5
+    if a1 == a2:
+        return 1.0
+    if len(a1) >= 4 and len(a2) >= 4 and a1[-4:] == a2[-4:]:
+        return 0.7
+    return 0.0
+
+
+def _amount_ok(b_amt, b_ccy, l_amt, l_ccy, config: MatchConfig) -> bool:
+    """Currency-aware amount equality check."""
+    if pd.isna(b_amt) or pd.isna(l_amt):
+        return False
+    b = _to_base(b_amt, b_ccy, config)
+    l = _to_base(l_amt, l_ccy, config)
+    if pd.isna(b) or pd.isna(l):
+        return False
+    diff = abs(b - l)
+    if diff <= config.amount_tolerance_abs:
+        return True
+    if config.amount_tolerance_pct > 0:
+        return diff <= abs(b) * config.amount_tolerance_pct
+    return False
+
+
+def _confidence(b_row: pd.Series, l_row: pd.Series,
+                config: MatchConfig, has_account: bool) -> float:
+    """Weighted confidence score (0–1). Returns 0 if accounts actively conflict."""
+    ref_s  = _ref_similarity(b_row['reference'], l_row['reference'])
+    date_s = _date_score(b_row['date'], l_row['date'], config.date_tolerance_days)
+
+    if has_account:
+        acct_s = _account_score(b_row.get('account'), l_row.get('account'))
+        if acct_s == 0.0:       # known accounts, but they don't match → veto
+            return 0.0
+        w = (config.reference_weight + config.amount_weight
+             + config.date_weight + config.account_weight)
+        return (config.reference_weight * ref_s
+                + config.amount_weight  * 1.0
+                + config.date_weight    * date_s
+                + config.account_weight * acct_s) / max(w, 1e-9)
+
+    w = config.reference_weight + config.amount_weight + config.date_weight
+    return (config.reference_weight * ref_s
+            + config.amount_weight  * 1.0
+            + config.date_weight    * date_s) / max(w, 1e-9)
+
+
+# ─── Standardise ──────────────────────────────────────────────────────────────
+
+def standardize_bank(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
+
+    col_map = {
+        # date
+        'txn_date': 'date', 'transaction_date': 'date', 'value_date': 'date',
+        'tran_date': 'date', 'trade_date': 'date',
+        # description
+        'narration': 'description', 'particulars': 'description',
+        'remarks': 'description', 'narrative': 'description', 'memo': 'description',
+        # reference
+        'reference': 'reference', 'ref_no': 'reference', 'utr': 'reference',
+        'txn_id': 'reference', 'trans_id': 'reference',
+        'transaction_id': 'reference', 'cheque': 'reference', 'chq': 'reference',
+        # amount
+        'amount': 'amount', 'debit': 'amount', 'withdrawal': 'amount',
+        'net_amount': 'amount',
+        # currency
+        'currency': 'currency', 'ccy': 'currency', 'curr': 'currency',
+        # account
+        'account': 'account', 'account_no': 'account', 'acc_no': 'account',
+        'account_number': 'account', 'bank_account': 'account', 'acct': 'account',
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+    df['date']   = _parse_dates(df['date'])
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+    df['reference'] = (df.get('reference',
+                               pd.Series([''] * len(df), index=df.index))
+                       .astype(str).str.strip().str.upper())
+    df['description'] = (df.get('description',
+                                 pd.Series([''] * len(df), index=df.index))
+                         .astype(str).str.strip().str.upper())
+    df['currency'] = (df['currency'].astype(str).str.strip().str.upper()
+                      if 'currency' in df.columns else pd.Series([None] * len(df), index=df.index))
+    df['account']  = (df['account'].astype(str).str.strip().str.upper()
+                      if 'account'  in df.columns else pd.Series([None] * len(df), index=df.index))
+    df['source']         = 'BANK'
+    df['original_index'] = df.index
+    return df
+
+
+def standardize_ledger(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
+
+    col_map = {
+        # date
+        'entry_date': 'date', 'posting_date': 'date', 'doc_date': 'date',
+        'tran_date': 'date', 'transaction_date': 'date',
+        # reference
+        'voucher_no': 'reference', 'document_no': 'reference', 'ref': 'reference',
+        'doc_no': 'reference', 'voucher': 'reference',
+        # description
+        'party_name': 'description', 'vendor': 'description', 'payee': 'description',
+        'narration': 'description', 'particulars': 'description', 'memo': 'description',
+        # amount
+        'amount': 'amount', 'net_amount': 'amount',
+        # currency
+        'currency': 'currency', 'ccy': 'currency', 'curr': 'currency',
+        # account
+        'account': 'account', 'account_no': 'account', 'acc_no': 'account',
+        'gl_account': 'account', 'account_number': 'account',
+        'ledger_account': 'account', 'acct': 'account',
+    }
+    safe = {k: v for k, v in col_map.items()
+            if k in df.columns and v not in df.columns}
+    df = df.rename(columns=safe)
+
+    df['date']   = _parse_dates(df['date'])
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+    df['reference'] = (df.get('reference',
+                               pd.Series([''] * len(df), index=df.index))
+                       .astype(str).str.strip().str.upper())
+    df['description'] = (df.get('description',
+                                 pd.Series([''] * len(df), index=df.index))
+                         .astype(str).str.strip().str.upper())
+    df['currency'] = (df['currency'].astype(str).str.strip().str.upper()
+                      if 'currency' in df.columns else pd.Series([None] * len(df), index=df.index))
+    df['account']  = (df['account'].astype(str).str.strip().str.upper()
+                      if 'account'  in df.columns else pd.Series([None] * len(df), index=df.index))
+    df['source']         = 'LEDGER'
+    df['original_index'] = df.index
+    return df
+
+
+# ─── Row builders ─────────────────────────────────────────────────────────────
+
+_MATCH_COLS = [
+    'bank_date', 'bank_amount', 'bank_reference', 'bank_description',
+    'ledger_date', 'ledger_amount', 'ledger_reference', 'ledger_description',
+    'confidence', 'match_type',
+    'bank_currency', 'ledger_currency',
+    'bank_account', 'ledger_account',
+]
+
+
+def _build_match_row(b, l, conf, mtype):
+    return [
+        b['date'],   b['amount'],   b['reference'],   b['description'],
+        l['date'],   l['amount'],   l['reference'],   l['description'],
+        round(conf, 2), mtype,
+        b.get('currency'), l.get('currency'),
+        b.get('account'),  l.get('account'),
+    ]
+
+
+def _build_composite_1_to_n(b_row, combo):
+    """One bank → N ledger items."""
+    l_refs  = '; '.join(str(r['reference'])        for _, r in combo)
+    l_descs = '; '.join(str(r['description'])[:25] for _, r in combo)
+    l_total = sum(r['amount'] for _, r in combo)
+    l_dates = '; '.join(
+        r['date'].strftime('%d-%b') if not pd.isna(r['date']) else '?'
+        for _, r in combo
+    )
+    return [
+        b_row['date'], b_row['amount'], b_row['reference'], b_row['description'],
+        l_dates, round(l_total, 2), l_refs, l_descs,
+        0.75, f'COMPOSITE_1_TO_{len(combo)}',
+        b_row.get('currency'), None,
+        b_row.get('account'),  None,
+    ]
+
+
+def _build_composite_n_to_1(combo, l_row):
+    """N bank items → one ledger."""
+    b_refs  = '; '.join(str(r['reference'])        for _, r in combo)
+    b_descs = '; '.join(str(r['description'])[:25] for _, r in combo)
+    b_total = sum(r['amount'] for _, r in combo)
+    b_dates = '; '.join(
+        r['date'].strftime('%d-%b') if not pd.isna(r['date']) else '?'
+        for _, r in combo
+    )
+    return [
+        b_dates, round(b_total, 2), b_refs, b_descs,
+        l_row['date'], l_row['amount'], l_row['reference'], l_row['description'],
+        0.75, f'COMPOSITE_{len(combo)}_TO_1',
+        None, l_row.get('currency'),
+        None, l_row.get('account'),
+    ]
+
+
+# ─── Composite candidate search ───────────────────────────────────────────────
+
+def _subset_sum_search(target: float, candidates: list,
+                        max_items: int, tol: float):
+    """
+    Search for a subset of candidates whose amounts sum to `target` within `tol`.
+    candidates: list of (idx, row)
+    Returns the matching subset list, or None.
+    Caps search at max_items and at 40 candidates (combinatorial safety).
+    """
+    if len(candidates) < 2:
+        return None
+    cands = candidates[:40]   # safety limit before combinatorics explode
+    for size in range(2, min(max_items + 1, len(cands) + 1)):
+        for combo in combinations(cands, size):
+            total = sum(float(r['amount']) for _, r in combo)
+            if abs(total - target) <= tol:
+                return list(combo)
+    return None
+
+
+def _composite_candidates_1_to_n(b_row, unmatched_l: pd.DataFrame,
+                                   config: MatchConfig):
+    """Pre-filter ledger candidates for a 1-to-N search."""
+    target = _to_base(b_row['amount'], b_row.get('currency'), config)
+    if pd.isna(target):
+        return []
+    tol    = max(config.amount_tolerance_abs,
+                 abs(target) * max(config.amount_tolerance_pct, 0.001))
+    return [
+        (idx, row)
+        for idx, row in unmatched_l.iterrows()
+        if (not pd.isna(row['amount'])
+            and target * row['amount'] >= 0                          # same sign
+            and abs(float(row['amount'])) < abs(target) + tol        # not larger than target
+            and (pd.isna(b_row['date']) or pd.isna(row['date'])
+                 or abs((b_row['date'] - row['date']).days) <= config.composite_date_slack))
+    ]
+
+
+def _composite_candidates_n_to_1(l_row, unmatched_b: pd.DataFrame,
+                                   config: MatchConfig):
+    """Pre-filter bank candidates for an N-to-1 search."""
+    target = _to_base(l_row['amount'], l_row.get('currency'), config)
+    if pd.isna(target):
+        return []
+    tol    = max(config.amount_tolerance_abs,
+                 abs(target) * max(config.amount_tolerance_pct, 0.001))
+    return [
+        (idx, row)
+        for idx, row in unmatched_b.iterrows()
+        if (not pd.isna(row['amount'])
+            and target * row['amount'] >= 0
+            and abs(float(row['amount'])) < abs(target) + tol
+            and (pd.isna(l_row['date']) or pd.isna(row['date'])
+                 or abs((l_row['date'] - row['date']).days) <= config.composite_date_slack))
+    ]
+
+
+# ─── Main reconcile ───────────────────────────────────────────────────────────
+
+def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
+              config: MatchConfig = None) -> dict:
+    """
+    4-pass reconciliation engine.
+
+    Returns
+    -------
+    {
+        'matched'          : DataFrame   – Pass 1 exact matches
+        'near_matched'     : DataFrame   – Pass 2 near matches
+        'composite'        : DataFrame   – Pass 3 + 4 composite matches
+        'unmatched_bank'   : DataFrame   – no match found
+        'unmatched_ledger' : DataFrame
+        'summary'          : dict
+    }
     """
     if config is None:
         config = MatchConfig()
 
-    bank = standardize_bank(bank_df)
+    bank   = standardize_bank(bank_df)
     ledger = standardize_ledger(ledger_df)
 
-    matched = []
-    near_matched = []
-    used_bank = set()
-    used_ledger = set()
+    # Auto-enable account weight when both sides have account data
+    has_account = (
+        bank['account'].notna().any()
+        and (bank['account'] != 'NONE').any()
+        and ledger['account'].notna().any()
+        and (ledger['account'] != 'NONE').any()
+    )
+    if has_account and config.account_weight == 0.0:
+        import dataclasses
+        config = dataclasses.replace(config, account_weight=0.20)
 
-    # --- Pass 1: Exact reference + amount match ---
+    matched      = []
+    near_matched = []
+    composite    = []
+    used_bank    = set()
+    used_ledger  = set()
+
+    # ── Pass 1: Exact / high-confidence 1-to-1 ───────────────────────────
     for b_idx, b_row in bank.iterrows():
         if b_idx in used_bank:
             continue
         for l_idx, l_row in ledger.iterrows():
             if l_idx in used_ledger:
                 continue
-            if not _amount_matches(b_row['amount'], l_row['amount'], config.amount_tolerance_pct):
+            if not _amount_ok(b_row['amount'], b_row.get('currency'),
+                              l_row['amount'], l_row.get('currency'), config):
                 continue
-
-            ref_score = _ref_similarity(b_row['reference'], l_row['reference'])
-            date_score = _date_score(b_row['date'], l_row['date'], config.date_tolerance_days)
-
-            # Weighted confidence
-            confidence = (
-                config.reference_weight * ref_score +
-                config.amount_weight * 1.0 +  # amount already matched
-                config.date_weight * date_score
-            )
-
-            if confidence >= 0.85:
-                matched.append(_build_match_row(b_row, l_row, confidence, 'EXACT'))
+            conf = _confidence(b_row, l_row, config, has_account)
+            if conf >= 0.85:
+                matched.append(_build_match_row(b_row, l_row, conf, 'EXACT'))
                 used_bank.add(b_idx)
                 used_ledger.add(l_idx)
                 break
 
-    # --- Pass 2: Near matches (amount match + date tolerance, weaker ref) ---
+    # ── Pass 2: Near-match 1-to-1 ─────────────────────────────────────────
     for b_idx, b_row in bank.iterrows():
         if b_idx in used_bank:
             continue
-        best_score = 0
-        best_match = None
-        best_l_idx = None
-
+        best_conf, best_l, best_l_idx = 0.0, None, None
         for l_idx, l_row in ledger.iterrows():
             if l_idx in used_ledger:
                 continue
-            if not _amount_matches(b_row['amount'], l_row['amount'], config.amount_tolerance_pct):
+            if not _amount_ok(b_row['amount'], b_row.get('currency'),
+                              l_row['amount'], l_row.get('currency'), config):
                 continue
-
-            ref_score = _ref_similarity(b_row['reference'], l_row['reference'])
-            date_score = _date_score(b_row['date'], l_row['date'], config.date_tolerance_days)
-
-            confidence = (
-                config.reference_weight * ref_score +
-                config.amount_weight * 1.0 +
-                config.date_weight * date_score
-            )
-
-            if confidence >= 0.50 and confidence > best_score:
-                best_score = confidence
-                best_match = l_row
-                best_l_idx = l_idx
-
-        if best_match is not None:
-            near_matched.append(_build_match_row(b_row, best_match, best_score, 'NEAR'))
+            conf = _confidence(b_row, l_row, config, has_account)
+            if conf >= 0.50 and conf > best_conf:
+                best_conf, best_l, best_l_idx = conf, l_row, l_idx
+        if best_l is not None:
+            near_matched.append(_build_match_row(b_row, best_l, best_conf, 'NEAR'))
             used_bank.add(b_idx)
             used_ledger.add(best_l_idx)
 
-    # --- Collect unmatched ---
-    unmatched_bank = bank[~bank.index.isin(used_bank)].copy()
+    # ── Pass 3: Composite 1-to-N ──────────────────────────────────────────
+    if config.composite_match and config.composite_max_items >= 2:
+        for b_idx, b_row in bank.iterrows():
+            if b_idx in used_bank:
+                continue
+            rem_l    = ledger[~ledger.index.isin(used_ledger)]
+            cands    = _composite_candidates_1_to_n(b_row, rem_l, config)
+            target   = _to_base(b_row['amount'], b_row.get('currency'), config)
+            tol      = max(config.amount_tolerance_abs,
+                           abs(target) * max(config.amount_tolerance_pct, 0.001))
+            result   = _subset_sum_search(target, cands, config.composite_max_items, tol)
+            if result:
+                composite.append(_build_composite_1_to_n(b_row, result))
+                used_bank.add(b_idx)
+                for l_idx, _ in result:
+                    used_ledger.add(l_idx)
+
+    # ── Pass 4: Composite N-to-1 ──────────────────────────────────────────
+    if config.composite_match and config.composite_max_items >= 2:
+        for l_idx, l_row in ledger.iterrows():
+            if l_idx in used_ledger:
+                continue
+            rem_b    = bank[~bank.index.isin(used_bank)]
+            cands    = _composite_candidates_n_to_1(l_row, rem_b, config)
+            target   = _to_base(l_row['amount'], l_row.get('currency'), config)
+            tol      = max(config.amount_tolerance_abs,
+                           abs(target) * max(config.amount_tolerance_pct, 0.001))
+            result   = _subset_sum_search(target, cands, config.composite_max_items, tol)
+            if result:
+                composite.append(_build_composite_n_to_1(result, l_row))
+                used_ledger.add(l_idx)
+                for b_idx, _ in result:
+                    used_bank.add(b_idx)
+
+    # ── Collect unmatched ─────────────────────────────────────────────────
+    unmatched_bank   = bank[~bank.index.isin(used_bank)].copy()
     unmatched_ledger = ledger[~ledger.index.isin(used_ledger)].copy()
 
-    # --- Build result DataFrames ---
-    match_cols = [
-        'bank_date', 'bank_amount', 'bank_reference', 'bank_description',
-        'ledger_date', 'ledger_amount', 'ledger_reference', 'ledger_description',
-        'confidence', 'match_type'
-    ]
+    # ── Build DataFrames ──────────────────────────────────────────────────
+    def _to_df(rows):
+        return (pd.DataFrame(rows, columns=_MATCH_COLS)
+                if rows else pd.DataFrame(columns=_MATCH_COLS))
 
-    matched_df = pd.DataFrame(matched, columns=match_cols) if matched else pd.DataFrame(columns=match_cols)
-    near_matched_df = pd.DataFrame(near_matched, columns=match_cols) if near_matched else pd.DataFrame(columns=match_cols)
+    matched_df      = _to_df(matched)
+    near_matched_df = _to_df(near_matched)
+    composite_df    = _to_df(composite)
+
+    export_cols = ['date', 'amount', 'reference', 'description']
+    if has_account:
+        export_cols.append('account')
+    if bank['currency'].notna().any():
+        export_cols.append('currency')
 
     summary = {
-        'total_bank': len(bank),
-        'total_ledger': len(ledger),
-        'exact_matches': len(matched_df),
-        'near_matches': len(near_matched_df),
-        'unmatched_bank': len(unmatched_bank),
-        'unmatched_ledger': len(unmatched_ledger),
-        'match_rate': round((len(matched_df) + len(near_matched_df)) / max(len(bank), 1) * 100, 1),
-        'bank_total': bank['amount'].sum(),
-        'ledger_total': ledger['amount'].sum(),
-        'difference': bank['amount'].sum() - ledger['amount'].sum(),
+        'total_bank':        len(bank),
+        'total_ledger':      len(ledger),
+        'exact_matches':     len(matched_df),
+        'near_matches':      len(near_matched_df),
+        'composite_matches': len(composite_df),
+        'unmatched_bank':    len(unmatched_bank),
+        'unmatched_ledger':  len(unmatched_ledger),
+        'match_rate': round(
+            (len(matched_df) + len(near_matched_df) + len(composite_df))
+            / max(len(bank), 1) * 100, 1
+        ),
+        'bank_total':    round(bank['amount'].sum(), 2),
+        'ledger_total':  round(ledger['amount'].sum(), 2),
+        'difference':    round(bank['amount'].sum() - ledger['amount'].sum(), 2),
+        'has_account':   has_account,
+        'has_currency':  (bank['currency'].notna().any()
+                          or ledger['currency'].notna().any()),
+        'base_currency': config.base_currency,
     }
 
     return {
-        'matched': matched_df,
-        'near_matched': near_matched_df,
-        'unmatched_bank': unmatched_bank[['date', 'amount', 'reference', 'description']],
-        'unmatched_ledger': unmatched_ledger[['date', 'amount', 'reference', 'description']],
-        'summary': summary,
+        'matched':          matched_df,
+        'near_matched':     near_matched_df,
+        'composite':        composite_df,
+        'unmatched_bank':   unmatched_bank[[c for c in export_cols if c in unmatched_bank.columns]],
+        'unmatched_ledger': unmatched_ledger[[c for c in export_cols if c in unmatched_ledger.columns]],
+        'summary':          summary,
     }
-
-
-def _build_match_row(bank_row, ledger_row, confidence, match_type):
-    """Build a single match result row."""
-    return [
-        bank_row['date'], bank_row['amount'], bank_row['reference'], bank_row['description'],
-        ledger_row['date'], ledger_row['amount'], ledger_row['reference'], ledger_row['description'],
-        round(confidence, 2), match_type,
-    ]
