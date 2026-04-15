@@ -4,217 +4,243 @@ Run: streamlit run app.py
 """
 
 import io
+import time
 import html as _html
 import streamlit as st
 import pandas as pd
 from matcher import reconcile, MatchConfig
 from month_end import generate_month_end_recon
 
+# ── Safety cap: rows processed per file ──
+MAX_ROWS = 5000
+
 # ── Page Config ──
 st.set_page_config(
     page_title="LedgerSync",
     page_icon="⬡",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ══════════════════════════════════════════════
-#  GLOBAL CSS
+#  GLOBAL CSS  — Web3 / Fintech Premium Theme
 # ══════════════════════════════════════════════
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 .stApp {
-    background: #0A1A2F;
+    background: #0B1220;
     background-image:
-        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(59,130,246,0.12) 0%, transparent 60%);
+        radial-gradient(ellipse 90% 55% at 50% -8%, rgba(59,130,246,0.18) 0%, transparent 58%),
+        radial-gradient(ellipse 45% 35% at 88% 12%, rgba(99,102,241,0.09) 0%, transparent 50%);
 }
 #MainMenu, footer, header { visibility: hidden; }
-.block-container { padding-top: 1.5rem; padding-bottom: 3rem; }
+.block-container { padding-top: 0.5rem !important; padding-bottom: 3rem !important; }
 
-[data-testid="stSidebar"] {
-    background: rgba(15,23,42,0.95) !important;
-    border-right: 1px solid rgba(59,130,246,0.2);
+/* ── Settings expander panel ── */
+.streamlit-expanderHeader {
+    background: rgba(17,24,39,0.88) !important;
+    border: 1px solid rgba(59,130,246,0.24) !important;
+    border-radius: 14px !important;
+    color: #94a3b8 !important;
+    font-size: 0.84rem !important;
+    font-weight: 500 !important;
+    padding: 0.75rem 1.2rem !important;
+    transition: border-color 0.2s, color 0.2s !important;
 }
-[data-testid="stSidebar"] .stSlider > div > div > div {
-    background: linear-gradient(90deg,#3B82F6,#1D4ED8) !important;
+.streamlit-expanderHeader:hover {
+    border-color: rgba(59,130,246,0.52) !important;
+    color: #e2e8f0 !important;
 }
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] p,
-[data-testid="stSidebar"] .stMarkdown { color: #94a3b8 !important; }
-[data-testid="stSidebar"] h1,
-[data-testid="stSidebar"] h2,
-[data-testid="stSidebar"] h3 { color: #e2e8f0 !important; }
+.streamlit-expanderContent {
+    background: rgba(11,18,32,0.95) !important;
+    border: 1px solid rgba(59,130,246,0.18) !important;
+    border-top: none !important;
+    border-radius: 0 0 14px 14px !important;
+    padding: 1.4rem 1.8rem 1.6rem !important;
+}
 
-/* sidebar divider */
-[data-testid="stSidebar"] hr {
-    border-color: rgba(59,130,246,0.15) !important;
-    margin: 0.6rem 0 !important;
-}
-/* sidebar caption — used as section labels */
-[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p,
-[data-testid="stSidebar"] small {
+/* ── Caption / section labels inside expander ── */
+[data-testid="stCaptionContainer"] p, small {
     color: #475569 !important;
     font-size: 0.62rem !important;
     letter-spacing: 0.09em !important;
     text-transform: uppercase !important;
     font-weight: 600 !important;
 }
-/* sidebar toggle label */
-[data-testid="stSidebar"] .stToggle p,
-[data-testid="stSidebar"] [data-testid="stToggleLabel"] {
-    color: #e2e8f0 !important;
-    font-size: 0.85rem !important;
-    font-weight: 500 !important;
+
+/* ── Slider ── */
+[data-testid="stSlider"] > div > div > div {
+    background: linear-gradient(90deg, #3B82F6, #1D4ED8) !important;
 }
 
 h1,h2,h3,h4,h5,h6,p,label,.stMarkdown { color: #e2e8f0; }
-hr { border-color: rgba(59,130,246,0.2) !important; }
+hr { border-color: rgba(59,130,246,0.15) !important; }
 
-/* inputs */
+/* ── Inputs ── */
 [data-testid="stNumberInput"] input,
 [data-testid="stTextInput"] input,
 [data-testid="stTextArea"] textarea {
-    background: rgba(30,41,59,0.7) !important;
-    border: 1px solid rgba(59,130,246,0.3) !important;
-    border-radius: 8px !important;
+    background: rgba(17,24,39,0.8) !important;
+    border: 1px solid rgba(59,130,246,0.28) !important;
+    border-radius: 9px !important;
     color: #e2e8f0 !important;
+    transition: border-color 0.2s !important;
+}
+[data-testid="stNumberInput"] input:focus,
+[data-testid="stTextInput"] input:focus,
+[data-testid="stTextArea"] textarea:focus {
+    border-color: rgba(59,130,246,0.65) !important;
 }
 [data-testid="stSelectbox"] > div > div {
-    background: rgba(30,41,59,0.7) !important;
+    background: rgba(17,24,39,0.8) !important;
     border: 1px solid rgba(59,130,246,0.25) !important;
-    border-radius: 8px !important;
+    border-radius: 9px !important;
     color: #e2e8f0 !important;
 }
 /* radio */
 [data-testid="stRadio"] label { color: #94a3b8 !important; font-size: 0.82rem !important; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { color: #94a3b8 !important; }
 
-/* upload */
+/* ── File uploader ── */
 [data-testid="stFileUploader"] {
-    background: rgba(30,41,59,0.6) !important;
-    border: 1px dashed rgba(59,130,246,0.4) !important;
-    border-radius: 12px !important;
-    padding: 1rem !important;
-    backdrop-filter: blur(8px);
+    background: rgba(17,24,39,0.72) !important;
+    border: 1.5px dashed rgba(59,130,246,0.32) !important;
+    border-radius: 14px !important;
+    padding: 1.1rem !important;
+    backdrop-filter: blur(10px);
+    transition: border-color 0.2s, background 0.2s !important;
 }
-[data-testid="stFileUploader"]:hover { border-color: rgba(59,130,246,0.8) !important; }
+[data-testid="stFileUploader"]:hover {
+    border-color: rgba(59,130,246,0.68) !important;
+    background: rgba(30,41,59,0.55) !important;
+}
 [data-testid="stFileUploader"] * { color: #cbd5e1 !important; }
 
-/* primary button */
+/* ── Primary CTA button ── */
 .stButton > button[kind="primary"] {
-    background: linear-gradient(135deg,#3B82F6 0%,#1D4ED8 100%) !important;
-    color: white !important;
+    background: linear-gradient(135deg, #3B82F6 0%, #1D4ED8 100%) !important;
+    color: #ffffff !important;
     border: none !important;
-    border-radius: 10px !important;
-    font-weight: 600 !important;
-    font-size: 0.95rem !important;
-    padding: 0.65rem 1.5rem !important;
-    box-shadow: 0 4px 20px rgba(59,130,246,0.35) !important;
-    transition: box-shadow 0.2s ease, transform 0.1s ease !important;
+    border-radius: 12px !important;
+    font-weight: 700 !important;
+    font-size: 1rem !important;
+    padding: 0.75rem 2rem !important;
+    box-shadow: 0 4px 24px rgba(59,130,246,0.42), inset 0 1px 0 rgba(255,255,255,0.08) !important;
+    letter-spacing: 0.01em !important;
+    transition: box-shadow 0.2s ease, transform 0.15s ease !important;
 }
 .stButton > button[kind="primary"]:hover {
-    box-shadow: 0 6px 28px rgba(59,130,246,0.55) !important;
-    transform: translateY(-1px) !important;
+    box-shadow: 0 6px 32px rgba(59,130,246,0.62), inset 0 1px 0 rgba(255,255,255,0.08) !important;
+    transform: translateY(-2px) !important;
 }
+.stButton > button[kind="primary"]:active { transform: translateY(0) !important; }
+/* secondary / download buttons */
 .stButton > button, .stDownloadButton > button {
-    background: rgba(30,41,59,0.7) !important;
+    background: rgba(17,24,39,0.75) !important;
     color: #e2e8f0 !important;
-    border: 1px solid rgba(59,130,246,0.3) !important;
+    border: 1px solid rgba(59,130,246,0.28) !important;
     border-radius: 10px !important;
     font-weight: 500 !important;
+    transition: background 0.2s, border-color 0.2s !important;
 }
 .stButton > button:hover, .stDownloadButton > button:hover {
-    background: rgba(59,130,246,0.15) !important;
-    border-color: rgba(59,130,246,0.6) !important;
+    background: rgba(59,130,246,0.12) !important;
+    border-color: rgba(59,130,246,0.55) !important;
 }
 
-/* tabs */
+/* ── Tabs ── */
 .stTabs [data-baseweb="tab-list"] {
     background: transparent !important;
-    border-bottom: 1px solid rgba(59,130,246,0.2) !important;
-    gap: 0.2rem;
+    border-bottom: 1px solid rgba(59,130,246,0.18) !important;
+    gap: 0.15rem;
 }
 .stTabs [data-baseweb="tab"] {
     background: transparent !important;
-    color: #64748b !important;
+    color: #475569 !important;
     border: none !important;
     border-radius: 8px 8px 0 0 !important;
     font-size: 0.8rem !important;
     font-weight: 500 !important;
-    padding: 0.45rem 0.8rem !important;
+    padding: 0.5rem 0.9rem !important;
+    transition: color 0.15s, background 0.15s !important;
 }
-.stTabs [data-baseweb="tab"]:hover { color: #a5b4fc !important; background: rgba(59,130,246,0.08) !important; }
+.stTabs [data-baseweb="tab"]:hover {
+    color: #94a3b8 !important;
+    background: rgba(59,130,246,0.06) !important;
+}
 .stTabs [aria-selected="true"] {
     color: #a5b4fc !important;
-    background: rgba(59,130,246,0.12) !important;
+    background: rgba(59,130,246,0.1) !important;
     border-bottom: 2px solid #3B82F6 !important;
 }
 
-/* dataframes */
-.stDataFrame,[data-testid="stDataFrame"] {
-    background: rgba(15,23,42,0.8) !important;
-    border: 1px solid rgba(59,130,246,0.2) !important;
+/* ── DataFrames ── */
+.stDataFrame, [data-testid="stDataFrame"] {
+    background: rgba(11,18,32,0.9) !important;
+    border: 1px solid rgba(59,130,246,0.18) !important;
     border-radius: 12px !important;
     overflow: hidden;
 }
 
-/* expanders */
-.streamlit-expanderHeader {
-    background: rgba(30,41,59,0.5) !important;
+/* ── Inline expanders (preview) ── */
+details > summary {
+    background: rgba(17,24,39,0.7) !important;
     border: 1px solid rgba(59,130,246,0.2) !important;
     border-radius: 10px !important;
     color: #94a3b8 !important;
 }
-.streamlit-expanderContent {
-    background: rgba(15,23,42,0.6) !important;
-    border: 1px solid rgba(59,130,246,0.15) !important;
-    border-top: none !important;
-    border-radius: 0 0 10px 10px !important;
-}
 
+/* ── Alerts ── */
 .stAlert {
-    background: rgba(30,41,59,0.7) !important;
+    background: rgba(17,24,39,0.8) !important;
     border-radius: 10px !important;
-    border: 1px solid rgba(59,130,246,0.25) !important;
+    border: 1px solid rgba(59,130,246,0.22) !important;
 }
 .stSpinner > div { border-top-color: #3B82F6 !important; }
 
 /* ── KPI cards ── */
 .kpi-card {
-    background: rgba(30,41,59,0.55);
-    border: 1px solid rgba(59,130,246,0.25);
-    border-radius: 16px;
-    padding: 1.4rem 1.5rem 1.2rem;
-    backdrop-filter: blur(12px);
-    box-shadow: 0 4px 24px rgba(0,0,0,0.3),inset 0 1px 0 rgba(255,255,255,0.05);
+    background: rgba(17,24,39,0.75);
+    border: 1px solid rgba(59,130,246,0.22);
+    border-radius: 18px;
+    padding: 1.5rem 1.6rem 1.3rem;
+    backdrop-filter: blur(16px);
+    box-shadow: 0 4px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
     position: relative; overflow: hidden;
-    transition: border-color 0.25s, box-shadow 0.25s;
+    transition: border-color 0.25s, box-shadow 0.25s, transform 0.2s;
 }
 .kpi-card::before {
-    content:''; position:absolute; top:0;left:0;right:0; height:2px;
-    background: linear-gradient(90deg,#3B82F6,#1D4ED8,transparent);
-    border-radius: 16px 16px 0 0;
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, #3B82F6 0%, #6366F1 50%, transparent 100%);
+    border-radius: 18px 18px 0 0;
 }
 .kpi-card:hover {
-    border-color: rgba(59,130,246,0.5);
-    box-shadow: 0 8px 32px rgba(59,130,246,0.2),inset 0 1px 0 rgba(255,255,255,0.07);
+    border-color: rgba(59,130,246,0.48);
+    box-shadow: 0 8px 40px rgba(59,130,246,0.18), inset 0 1px 0 rgba(255,255,255,0.06);
+    transform: translateY(-1px);
 }
-.kpi-label { font-size:0.68rem;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#64748b;margin-bottom:0.6rem; }
-.kpi-value { font-size:2rem;font-weight:700;line-height:1;
-    background:linear-gradient(135deg,#e2e8f0 0%,#a5b4fc 100%);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
-    margin-bottom:0.25rem; }
-.kpi-sub { font-size:0.73rem;color:#475569; }
+.kpi-label {
+    font-size: 0.66rem; font-weight: 700; letter-spacing: 0.1em;
+    text-transform: uppercase; color: #475569; margin-bottom: 0.7rem;
+}
+.kpi-value {
+    font-size: 2.1rem; font-weight: 800; line-height: 1;
+    background: linear-gradient(135deg, #f1f5f9 0%, #a5b4fc 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    margin-bottom: 0.3rem;
+}
+.kpi-sub { font-size: 0.72rem; color: #475569; }
 
-/* ── Pill ── */
+/* ── Section pill header ── */
 .section-pill {
-    display:inline-block;background:rgba(59,130,246,0.12);
-    border:1px solid rgba(59,130,246,0.3);border-radius:20px;
-    padding:0.2rem 0.8rem;font-size:0.68rem;font-weight:600;
-    letter-spacing:0.08em;text-transform:uppercase;color:#a5b4fc;margin-bottom:0.5rem;
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.28);
+    border-radius: 20px; padding: 0.22rem 0.9rem;
+    font-size: 0.67rem; font-weight: 700;
+    letter-spacing: 0.09em; text-transform: uppercase; color: #a5b4fc; margin-bottom: 0.6rem;
 }
 
 /* ── Badges ── */
@@ -223,21 +249,24 @@ hr { border-color: rgba(59,130,246,0.2) !important; }
 .badge-composite { display:inline-block;background:rgba(139,92,246,0.15);border:1px solid rgba(139,92,246,0.35);color:#c084fc;border-radius:6px;padding:0.1rem 0.55rem;font-size:0.7rem;font-weight:600; }
 .badge-exception { display:inline-block;background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.35);color:#f87171;border-radius:6px;padding:0.1rem 0.55rem;font-size:0.7rem;font-weight:600; }
 
-/* ── Mapper card ── */
-.mapper-card {
-    background:rgba(30,41,59,0.5);border:1px solid rgba(59,130,246,0.22);
-    border-radius:14px;padding:1.2rem 1.4rem;backdrop-filter:blur(10px);
+/* ── Upload source cards ── */
+.upload-label {
+    font-size: 0.68rem; font-weight: 700; letter-spacing: 0.1em;
+    text-transform: uppercase; color: #475569; margin-bottom: 0.6rem;
 }
-.mapper-title { font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#3B82F6;margin-bottom:0.8rem; }
 
-/* ── BRS ── */
+/* ── Mapper card ── */
+.mapper-title { font-size:0.67rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#3B82F6;margin-bottom:0.85rem; }
+
+/* ── BRS Statement ── */
 .brs-wrap {
-    background: rgba(30,41,59,0.5);
-    border: 1px solid rgba(59,130,246,0.22);
-    border-radius: 16px;
-    padding: 1.8rem 2rem;
-    backdrop-filter: blur(12px);
+    background: rgba(17,24,39,0.72);
+    border: 1px solid rgba(59,130,246,0.2);
+    border-radius: 18px;
+    padding: 1.8rem 2.2rem;
+    backdrop-filter: blur(16px);
     width: 100%;
+    box-shadow: 0 4px 32px rgba(0,0,0,0.35);
 }
 .brs-title {
     font-size: 1rem;
@@ -317,13 +346,17 @@ hr { border-color: rgba(59,130,246,0.2) !important; }
 .brs-diff-nonzero { color: #f87171 !important; }
 .brs-note { font-size: 0.7rem; color: #475569; font-weight: 400; margin-left: 0.5rem; }
 
-/* ── footer ── */
-.xbp-footer { text-align:center;color:#334155;font-size:0.72rem;
-    letter-spacing:0.06em;padding:2.5rem 0 1rem;
-    border-top:1px solid rgba(59,130,246,0.1);margin-top:3rem; }
-.xbp-footer span { background:linear-gradient(90deg,#3B82F6,#1D4ED8);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-    background-clip:text;font-weight:600; }
+/* ── Footer ── */
+.xbp-footer {
+    text-align: center; color: #1e293b; font-size: 0.7rem;
+    letter-spacing: 0.07em; padding: 2.5rem 0 1rem;
+    border-top: 1px solid rgba(59,130,246,0.08); margin-top: 3.5rem;
+}
+.xbp-footer span {
+    background: linear-gradient(90deg, #3B82F6, #6366F1);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; font-weight: 700;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -423,32 +456,94 @@ def _col_mapper_ui(df: pd.DataFrame, label: str, key_prefix: str) -> dict:
     }
 
 
-def _preprocess_df(df_raw: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+def _preprocess_df(df_raw: pd.DataFrame, mapping: dict) -> pd.DataFrame | None:
     """
     Apply user column mapping and handle debit/credit combining.
-    Returns a DataFrame with standard column names ready for reconcile().
+    Returns a DataFrame with standard column names ready for reconcile(),
+    or None if required columns are missing (errors shown via st.error).
     """
     df = df_raw.copy()
 
-    # Rename standard fields
+    # Normalize column names (defensive — load_file already does this)
+    df.columns = df.columns.str.strip().str.lower()
+
+    # ── Validate required date column ──
+    date_col = mapping.get('date')
+    if not date_col:
+        st.error("Date column not mapped. Please select a date column.")
+        return None
+    if date_col not in df.columns:
+        st.error(
+            f"Date column **'{date_col}'** not found in the file. "
+            "Please verify the column mapping."
+        )
+        return None
+
+    # ── Rename standard optional fields ──
     for field in ('date', 'reference', 'description', 'currency', 'account'):
         col = mapping.get(field)
         if col and col in df.columns and col != field:
             df = df.rename(columns={col: field})
 
-    # Amount handling
+    # ── Strip whitespace from all string columns ──
+    for col in df.select_dtypes(include='object').columns:
+        df[col] = df[col].astype(str).str.strip().replace({'nan': pd.NA, 'None': pd.NA, '': pd.NA})
+
+    # ── Amount handling ──
     if mapping.get('amount'):
         src = mapping['amount']
+        if src not in df.columns and src != 'amount':
+            st.error(
+                f"Amount column **'{src}'** not found. Please check mapping."
+            )
+            return None
         if src in df.columns and src != 'amount':
             df = df.rename(columns={src: 'amount'})
+        df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+
     elif mapping.get('debit') and mapping.get('credit'):
-        dr = pd.to_numeric(df.get(mapping['debit'],  0), errors='coerce').fillna(0)
-        cr = pd.to_numeric(df.get(mapping['credit'], 0), errors='coerce').fillna(0)
+        dr_col, cr_col = mapping['debit'], mapping['credit']
+        for col_name, label in ((dr_col, 'Debit'), (cr_col, 'Credit')):
+            if col_name not in df.columns:
+                st.error(
+                    f"{label} column **'{col_name}'** not found. Please check mapping."
+                )
+                return None
+        dr = pd.to_numeric(df[dr_col], errors='coerce').fillna(0)
+        cr = pd.to_numeric(df[cr_col], errors='coerce').fillna(0)
         df['amount'] = cr - dr   # net: inflows positive, outflows negative
+
     elif mapping.get('debit'):
-        df['amount'] = -pd.to_numeric(df[mapping['debit']], errors='coerce')
+        dr_col = mapping['debit']
+        if dr_col not in df.columns:
+            st.error(f"Debit column **'{dr_col}'** not found. Please check mapping.")
+            return None
+        df['amount'] = -pd.to_numeric(df[dr_col], errors='coerce')
+
     elif mapping.get('credit'):
-        df['amount'] = pd.to_numeric(df[mapping['credit']], errors='coerce')
+        cr_col = mapping['credit']
+        if cr_col not in df.columns:
+            st.error(f"Credit column **'{cr_col}'** not found. Please check mapping.")
+            return None
+        df['amount'] = pd.to_numeric(df[cr_col], errors='coerce')
+
+    # ── Final guard: amount column must exist ──
+    if 'amount' not in df.columns:
+        st.error("Amount column not found after mapping. Please check your column selections.")
+        return None
+
+    # ── Warn about rows with invalid amounts ──
+    bad_amt = df['amount'].isna().sum()
+    if bad_amt == len(df):
+        st.error(
+            "No data found after processing. All amount values are invalid or non-numeric. "
+            "Please verify the file format and column mappings."
+        )
+        return None
+    if bad_amt > 0:
+        st.warning(
+            f"{bad_amt:,} row(s) have non-numeric amounts and will be treated as zero / skipped."
+        )
 
     return df
 
@@ -467,10 +562,55 @@ def _parse_fx_rates(text: str) -> dict:
     return rates
 
 
-def load_file(uploaded_file) -> pd.DataFrame:
-    if uploaded_file.name.endswith('.csv'):
-        return pd.read_csv(uploaded_file)
-    return pd.read_excel(uploaded_file)
+@st.cache_data(show_spinner=False)
+def _parse_file_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame | None:
+    """Cache-friendly parser: takes raw bytes so Streamlit can hash the input."""
+    try:
+        name = filename.lower()
+        if name.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(file_bytes))
+        elif name.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(io.BytesIO(file_bytes))
+        else:
+            return None
+        # Normalize column names immediately after load
+        df.columns = df.columns.str.strip().str.lower()
+        return df
+    except Exception:
+        return None
+
+
+def load_file(uploaded_file) -> pd.DataFrame | None:
+    """
+    Load an uploaded file, normalize columns, validate, and enforce the row cap.
+    Returns None (and shows a user-friendly error) on any failure.
+    """
+    try:
+        df = _parse_file_bytes(uploaded_file.getvalue(), uploaded_file.name)
+    except Exception:
+        st.error("Error reading file. Please verify the file is not corrupted and try again.")
+        return None
+
+    if df is None:
+        st.error(
+            f"Invalid file format for **{uploaded_file.name}**. "
+            "Please upload a CSV or Excel file (.csv, .xlsx, .xls)."
+        )
+        return None
+
+    if df.empty:
+        st.error(f"No data found in **{uploaded_file.name}**. The file appears to be empty.")
+        return None
+
+    if len(df) > MAX_ROWS:
+        st.warning(
+            f"**{uploaded_file.name}** has {len(df):,} rows. "
+            f"Processing is limited to the first **{MAX_ROWS:,} rows** for performance. "
+            "Split the file into smaller batches for full processing."
+        )
+        df = df.head(MAX_ROWS)
+
+    return df
 
 
 def safe_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -709,147 +849,158 @@ def _combine_account_results(per_account: dict) -> dict:
 # ══════════════════════════════════════════════
 #  HEADER
 # ══════════════════════════════════════════════
-st.markdown("""
-<div style="text-align:center;padding:2rem 0 1.8rem;">
-    <h1 style="font-size:3rem;font-weight:700;letter-spacing:-0.03em;margin:0;
-               color:#F1F5F9;line-height:1.1;">
-        LedgerSync
-    </h1>
-    <p style="font-size:0.82rem;color:#64748b;font-weight:400;margin-top:0.4rem;
-              letter-spacing:0.02em;">by R@k</p>
-</div>
-""", unsafe_allow_html=True)
+st.markdown(
+    '<div style="padding:2.8rem 0 2rem;text-align:center;">'
+    '<div style="display:inline-flex;align-items:center;gap:0.55rem;margin-bottom:0.55rem;">'
+    '<span style="font-size:1.6rem;filter:drop-shadow(0 0 8px rgba(99,102,241,0.5));">⬡</span>'
+    '<span style="font-size:2.9rem;font-weight:800;letter-spacing:-0.04em;line-height:1;'
+    'background:linear-gradient(135deg,#f1f5f9 30%,#a5b4fc 100%);'
+    '-webkit-background-clip:text;-webkit-text-fill-color:transparent;'
+    'background-clip:text;">LedgerSync</span>'
+    '</div>'
+    '<div style="font-size:0.78rem;font-weight:600;letter-spacing:0.14em;'
+    'text-transform:uppercase;color:#475569;margin-bottom:0.3rem;">Financial Intelligence Platform</div>'
+    '<div style="display:inline-flex;align-items:center;gap:0.4rem;'
+    'background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.18);'
+    'border-radius:20px;padding:0.18rem 0.75rem;margin-top:0.2rem;">'
+    '<span style="width:6px;height:6px;background:#34d399;border-radius:50%;'
+    'display:inline-block;box-shadow:0 0 6px #34d399;"></span>'
+    '<span style="font-size:0.65rem;font-weight:600;letter-spacing:0.06em;'
+    'text-transform:uppercase;color:#64748b;">Live · by R@k</span>'
+    '</div>'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
 
 # ══════════════════════════════════════════════
-#  SIDEBAR
+#  SETTINGS  (replaces sidebar — expander panel)
 # ══════════════════════════════════════════════
-with st.sidebar:
 
-    # ── Branding ──────────────────────────────
-    st.markdown("""
-    <div style="padding:0.25rem 0 1rem;border-bottom:1px solid rgba(59,130,246,0.2);margin-bottom:0.75rem;">
-        <div style="font-size:1.1rem;font-weight:700;
-                    background:linear-gradient(90deg,#a5b4fc,#1D4ED8);
-                    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-                    background-clip:text;">LedgerSync</div>
-        <div style="font-size:0.62rem;color:#475569;margin-top:0.15rem;">by R@k</div>
-    </div>
-    """, unsafe_allow_html=True)
+# Smart defaults — always defined so the rest of the app has valid values
+# even if the expander is collapsed without changes.
+advanced_mode   = False
+opening_balance = 0.0
+period_label    = "Current Period"
+date_tolerance  = 3
+amount_tol_abs  = 0.01
+ref_weight      = 0.40
+amt_weight      = 0.35
+date_weight     = 0.25
+composite_match = True
+composite_max   = 5
+composite_slack = 14
+base_currency   = 'INR'
+fx_rates        = _parse_fx_rates(
+    "USD=84.50\nEUR=91.20\nGBP=107.80\nAED=23.00\nSGD=63.00\nAUD=55.00\nJPY=0.56"
+)
 
-    # ── Mode Toggle ───────────────────────────
-    advanced_mode = st.toggle(
-        "Advanced Mode",
-        value=False,
-        help="Unlock match weights, composite controls, and FX rate settings",
-    )
+with st.expander("⚙️  Settings & Configuration", expanded=False):
 
-    # ── BRS Settings (always visible) ─────────
-    st.divider()
-    st.caption("BRS Settings")
-    opening_balance = st.number_input(
-        "Opening Ledger Balance",
-        value=0.0, step=1000.0, format="%.2f",
-        help="Ledger balance at the start of the reconciliation period",
-    )
-    period_label = st.text_input(
-        "Period",
-        value="Current Period",
-        help="e.g. April 2026 — used in BRS header and export filename",
-    )
+    # ── Row 1: Core BRS settings + mode toggle ──
+    cfg1, cfg2, cfg3 = st.columns([1.3, 1.3, 0.8])
+    with cfg1:
+        opening_balance = st.number_input(
+            "💰  Opening Ledger Balance",
+            value=0.0, step=1000.0, format="%.2f",
+            help="Ledger balance at the start of the reconciliation period",
+        )
+    with cfg2:
+        period_label = st.text_input(
+            "📅  Period Label",
+            value="Current Period",
+            help="e.g. April 2026 — used in BRS header and export filename",
+        )
+    with cfg3:
+        st.markdown('<div style="margin-top:1.9rem;"></div>', unsafe_allow_html=True)
+        advanced_mode = st.toggle(
+            "Advanced Mode",
+            value=False,
+            help="Unlock match tolerances, weights, composite controls, and FX settings",
+        )
 
-    # ── Smart defaults (always defined) ───────
-    # Auto mode uses these directly; advanced mode overwrites them below.
-    date_tolerance  = 3
-    amount_tol_abs  = 0.01
-    ref_weight      = 0.40
-    amt_weight      = 0.35
-    date_weight     = 0.25
-    composite_match = True
-    composite_max   = 5
-    composite_slack = 14
-    base_currency   = 'INR'
-    fx_rates        = _parse_fx_rates(
-        "USD=84.50\nEUR=91.20\nGBP=107.80\nAED=23.00\nSGD=63.00\nAUD=55.00\nJPY=0.56"
-    )
-
-    # ── Advanced Settings ─────────────────────
+    # ── Advanced settings grid (shown when toggled) ──
     if advanced_mode:
-
         st.divider()
-        st.caption("Match Tolerances")
-        date_tolerance = st.slider(
-            "Date tolerance (days)", 0, 7, 3,
-            help="Days of slack allowed between bank and book dates",
-        )
-        amount_tol_abs = st.number_input(
-            "Amount rounding tolerance", value=0.01, step=0.01, format="%.2f",
-            help="Absolute floor for rounding differences (e.g. 0.01 = 1 paise)",
-        )
+        adv1, adv2, adv3 = st.columns(3, gap="large")
 
-        st.caption("Match Weights")
-        ref_weight  = st.slider("Reference weight", 0.0, 1.0, 0.40, 0.05)
-        amt_weight  = st.slider("Amount weight",    0.0, 1.0, 0.35, 0.05)
-        date_weight = st.slider("Date weight",      0.0, 1.0, 0.25, 0.05)
-        _tw = ref_weight + amt_weight + date_weight
-        if _tw > 0:
-            ref_weight  /= _tw
-            amt_weight  /= _tw
-            date_weight /= _tw
-
-        st.caption("Part-Payment Matching")
-        composite_match = st.toggle(
-            "Enable composite (1-to-N / N-to-1)", value=True,
-            help="Resolve split payments: one bank entry = multiple ledger items, or vice versa",
-        )
-        if composite_match:
-            composite_max   = st.slider(
-                "Max items per group", 2, 8, 5,
-                help="Higher catches larger splits but is slower on big files",
+        with adv1:
+            st.caption("Match Tolerances")
+            date_tolerance = st.slider(
+                "Date tolerance (days)", 0, 7, 3,
+                help="Days of slack allowed between bank and book dates",
             )
-            composite_slack = st.slider(
-                "Date window (days)", 7, 60, 14,
-                help="Maximum date gap between part-payment entries",
+            amount_tol_abs = st.number_input(
+                "Amount rounding tolerance", value=0.01, step=0.01, format="%.2f",
+                help="Absolute floor for rounding differences (e.g. 0.01 = 1 paise)",
             )
 
-        st.caption("Currency & FX")
-        base_currency = st.selectbox(
-            "Base currency",
-            ['INR', 'USD', 'EUR', 'GBP', 'AED', 'SGD', 'AUD', 'JPY', 'Other'],
-            index=0,
-            help="All amounts are normalised to this currency for matching",
-        )
-        fx_rates_text = st.text_area(
-            "FX Rates  (CCY=rate, one per line)",
-            value="USD=84.50\nEUR=91.20\nGBP=107.80\nAED=23.00\nSGD=63.00\nAUD=55.00\nJPY=0.56",
-            height=80,
-            help="Applied only when your files contain a Currency column",
-        )
-        fx_rates = _parse_fx_rates(fx_rates_text)
+            st.caption("Part-Payment Matching")
+            composite_match = st.toggle(
+                "Enable composite (1-to-N / N-to-1)", value=True,
+                help="Resolve split payments: one bank entry = multiple ledger items, or vice versa",
+            )
+            if composite_match:
+                composite_max   = st.slider(
+                    "Max items per group", 2, 8, 5,
+                    help="Higher catches larger splits but is slower on big files",
+                )
+                composite_slack = st.slider(
+                    "Date window (days)", 7, 60, 14,
+                    help="Maximum date gap between part-payment entries",
+                )
 
-    # ── Status note ───────────────────────────
-    st.divider()
-    if advanced_mode:
+        with adv2:
+            st.caption("Match Weights")
+            ref_weight  = st.slider("Reference weight", 0.0, 1.0, 0.40, 0.05)
+            amt_weight  = st.slider("Amount weight",    0.0, 1.0, 0.35, 0.05)
+            date_weight = st.slider("Date weight",      0.0, 1.0, 0.25, 0.05)
+            _tw = ref_weight + amt_weight + date_weight
+            if _tw > 0:
+                ref_weight  /= _tw
+                amt_weight  /= _tw
+                date_weight /= _tw
+
+        with adv3:
+            st.caption("Currency & FX")
+            base_currency = st.selectbox(
+                "Base currency",
+                ['INR', 'USD', 'EUR', 'GBP', 'AED', 'SGD', 'AUD', 'JPY', 'Other'],
+                index=0,
+                help="All amounts are normalised to this currency for matching",
+            )
+            fx_rates_text = st.text_area(
+                "FX Rates  (CCY=rate, one per line)",
+                value="USD=84.50\nEUR=91.20\nGBP=107.80\nAED=23.00\nSGD=63.00\nAUD=55.00\nJPY=0.56",
+                height=100,
+                help="Applied only when your files contain a Currency column",
+            )
+            fx_rates = _parse_fx_rates(fx_rates_text)
+
+        # ── Active config summary badge ──
+        st.divider()
+        comp_state = f"<span style='color:#34d399;'>On</span>" if composite_match else "<span style='color:#f87171;'>Off</span>"
         st.markdown(
-            f"<div style='font-size:0.72rem;color:#475569;line-height:1.9;'>"
-            f"<span style='color:#3B82F6;font-weight:600;font-size:0.63rem;"
-            f"letter-spacing:0.06em;'>ACTIVE CONFIG</span><br>"
-            f"Date tol: <span style='color:#a5b4fc;'>{date_tolerance}d</span> &nbsp;·&nbsp; "
-            f"Base: <span style='color:#a5b4fc;'>{base_currency}</span><br>"
-            f"Composite: <span style='color:{'#34d399' if composite_match else '#f87171'};'>"
-            f"{'On' if composite_match else 'Off'}</span>"
+            f"<div style='font-size:0.72rem;color:#475569;line-height:2;'>"
+            f"<span style='color:#3B82F6;font-weight:700;font-size:0.62rem;"
+            f"letter-spacing:0.08em;text-transform:uppercase;'>Active Config</span>"
+            f" &nbsp;·&nbsp; "
+            f"Date tol: <span style='color:#a5b4fc;'>{date_tolerance}d</span>"
+            f" &nbsp;·&nbsp; "
+            f"Base: <span style='color:#a5b4fc;'>{base_currency}</span>"
+            f" &nbsp;·&nbsp; "
+            f"Composite: {comp_state}"
             f"</div>",
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            "<div style='font-size:0.72rem;color:#475569;line-height:1.9;'>"
-            "<span style='color:#3B82F6;font-weight:600;font-size:0.63rem;"
-            "letter-spacing:0.06em;'>AUTO MODE</span><br>"
-            "✅ Smart defaults applied<br>"
-            "✅ Composite matching on<br>"
-            "✅ All 4 match passes active<br>"
-            "✅ Account matching auto-enabled"
+            "<div style='font-size:0.72rem;color:#334155;margin-top:0.5rem;"
+            "display:flex;gap:1.5rem;flex-wrap:wrap;'>"
+            "<span>✅ Smart defaults active</span>"
+            "<span>✅ Composite matching on</span>"
+            "<span>✅ All 4 match passes</span>"
+            "<span>✅ Account matching auto</span>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -858,19 +1009,30 @@ with st.sidebar:
 # ══════════════════════════════════════════════
 #  FILE UPLOAD
 # ══════════════════════════════════════════════
-st.markdown('<div class="section-pill">Data Sources</div>', unsafe_allow_html=True)
+st.markdown('<div style="margin-top:1.5rem;"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-pill">📂  Data Sources</div>', unsafe_allow_html=True)
+
 u1, u2 = st.columns(2, gap="large")
 
 with u1:
-    st.markdown('<div style="color:#94a3b8;font-size:0.8rem;font-weight:500;margin-bottom:0.4rem;">BANK STATEMENT</div>',
-                unsafe_allow_html=True)
-    bank_file = st.file_uploader("Bank statement", type=['csv','xlsx','xls'],
-                                  key='bank', label_visibility='collapsed')
+    st.markdown(
+        '<div class="upload-label">🏦  Bank Statement</div>',
+        unsafe_allow_html=True,
+    )
+    bank_file = st.file_uploader(
+        "Bank statement", type=['csv', 'xlsx', 'xls'],
+        key='bank', label_visibility='collapsed',
+    )
+
 with u2:
-    st.markdown('<div style="color:#94a3b8;font-size:0.8rem;font-weight:500;margin-bottom:0.4rem;">LEDGER / CASHBOOK</div>',
-                unsafe_allow_html=True)
-    ledger_file = st.file_uploader("Ledger", type=['csv','xlsx','xls'],
-                                    key='ledger', label_visibility='collapsed')
+    st.markdown(
+        '<div class="upload-label">📒  Ledger / Cashbook</div>',
+        unsafe_allow_html=True,
+    )
+    ledger_file = st.file_uploader(
+        "Ledger", type=['csv', 'xlsx', 'xls'],
+        key='ledger', label_visibility='collapsed',
+    )
 
 
 # ══════════════════════════════════════════════
@@ -880,31 +1042,31 @@ if bank_file and ledger_file:
     bank_df_raw   = load_file(bank_file)
     ledger_df_raw = load_file(ledger_file)
 
+    # Stop early if either file could not be loaded
+    if bank_df_raw is None or ledger_df_raw is None:
+        st.stop()
+
     with st.expander("Preview — Bank Statement", expanded=False):
         st.dataframe(bank_df_raw, use_container_width=True)
     with st.expander("Preview — Ledger / Cashbook", expanded=False):
         st.dataframe(ledger_df_raw, use_container_width=True)
 
-    st.markdown('<div style="margin:1.5rem 0 0.5rem;"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-pill">Column Mapping</div>', unsafe_allow_html=True)
+    st.markdown('<div style="margin:2rem 0 0.6rem;"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-pill">🗂️  Column Mapping</div>', unsafe_allow_html=True)
     st.markdown("""
-    <div style="color:#64748b;font-size:0.8rem;margin-bottom:0.9rem;">
+    <div style="color:#475569;font-size:0.8rem;margin-bottom:1rem;line-height:1.6;">
         Map your file columns to the required fields. Fields marked
-        <span style="color:#3B82F6;">*</span> are required.
+        <span style="color:#3B82F6;font-weight:600;">*</span> are required.
         Columns are auto-detected where possible — confirm before running.
     </div>""", unsafe_allow_html=True)
 
     m1, m2 = st.columns(2, gap="large")
 
     with m1:
-        st.markdown('<div class="mapper-card">', unsafe_allow_html=True)
         bank_mapping = _col_mapper_ui(bank_df_raw, "Bank Statement Columns", "bank")
-        st.markdown('</div>', unsafe_allow_html=True)
 
     with m2:
-        st.markdown('<div class="mapper-card">', unsafe_allow_html=True)
         ledger_mapping = _col_mapper_ui(ledger_df_raw, "Ledger Columns", "ledger")
-        st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div style="margin:1.2rem 0;"></div>', unsafe_allow_html=True)
 
@@ -922,8 +1084,12 @@ if bank_file and ledger_file:
     if st.button("Run Reconciliation", type="primary",
                  use_container_width=True, disabled=not mapping_ok):
 
+        # ── Preprocess & validate columns ──
         bank_df   = _preprocess_df(bank_df_raw,   bank_mapping)
         ledger_df = _preprocess_df(ledger_df_raw, ledger_mapping)
+
+        if bank_df is None or ledger_df is None:
+            st.stop()
 
         config = MatchConfig(
             date_tolerance_days  = date_tolerance,
@@ -938,18 +1104,54 @@ if bank_file and ledger_file:
             composite_date_slack = composite_slack,
         )
 
-        with st.spinner("Analysing transactions…"):
-            if len(bank_df) > 2000:
-                config.composite_match = False
+        try:
+            with st.spinner("Reconciling transactions… please wait"):
+                if len(bank_df) > 2000:
+                    config.composite_match = False
 
-            results   = reconcile(bank_df, ledger_df, config)
-            month_end = generate_month_end_recon(results, opening_ledger_balance=opening_balance)
+                _wall0   = time.perf_counter()
+                results  = reconcile(bank_df, ledger_df, config)
+                _wall1   = time.perf_counter()
+                month_end = generate_month_end_recon(results, opening_ledger_balance=opening_balance)
+                _wall2   = time.perf_counter()
+                print(f"[LedgerSync] app reconcile(): {_wall1 - _wall0:.3f}s  "
+                      f"month_end: {_wall2 - _wall1:.3f}s  "
+                      f"total: {_wall2 - _wall0:.3f}s")
 
-        st.session_state['results']      = results
-        st.session_state['month_end']    = month_end
-        st.session_state['period_label'] = period_label
-        st.session_state['opening_bal']  = opening_balance
-        st.success("Reconciliation complete.")
+            st.session_state['results']      = results
+            st.session_state['month_end']    = month_end
+            st.session_state['period_label'] = period_label
+            st.session_state['opening_bal']  = opening_balance
+            st.success("Reconciliation complete.")
+
+            # ── Post-run warnings ──
+            s = results['summary']
+            unmatched_pct = (s['unmatched_bank'] / max(s['total_bank'], 1)) * 100
+            if unmatched_pct > 30:
+                st.warning(
+                    f"{s['unmatched_bank']:,} bank transactions ({unmatched_pct:.0f}%) could not be matched. "
+                    "Check column mappings, date formats, and whether the correct files were uploaded."
+                )
+            if s['unmatched_ledger'] > 50:
+                st.warning(
+                    f"{s['unmatched_ledger']:,} ledger entries have no matching bank transaction. "
+                    "These may represent outstanding payments or data entry errors."
+                )
+            if not month_end['recon_table'].empty:
+                dup_count = (month_end['recon_table'].get('status', pd.Series()) == 'ERROR_DUPLICATE').sum()
+                if dup_count > 0:
+                    st.warning(
+                        f"{dup_count} possible duplicate transaction(s) detected. "
+                        "Review the 'Month-End View' tab for details."
+                    )
+
+        except Exception:
+            st.error(
+                "Error processing file. Please verify format and mappings. "
+                "If the problem persists, check that date columns contain valid dates "
+                "and amount columns contain numbers only."
+            )
+            st.stop()
 
 
 # ══════════════════════════════════════════════
@@ -975,7 +1177,7 @@ if 'results' in st.session_state:
 
     # ── KPI Cards ──
     st.markdown('<div style="margin:2rem 0 0.5rem;"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-pill">Reconciliation Summary</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-pill">📊  Reconciliation Summary</div>', unsafe_allow_html=True)
 
     rate_color = "#34d399" if rate >= 85 else "#fbbf24" if rate >= 60 else "#f87171"
     exc_color  = "#34d399" if exceptions == 0 else "#f87171"
@@ -1026,8 +1228,8 @@ if 'results' in st.session_state:
         </div>""", unsafe_allow_html=True)
 
     # ── Balances row ──
-    st.markdown('<div style="margin:1.5rem 0 0.5rem;"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-pill">Balances</div>', unsafe_allow_html=True)
+    st.markdown('<div style="margin:1.8rem 0 0.5rem;"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-pill">💰  Balances</div>', unsafe_allow_html=True)
 
     t1, t2, t3 = st.columns(3, gap="medium")
     with t1:
@@ -1055,7 +1257,7 @@ if 'results' in st.session_state:
     #  TABS
     # ══════════════════════════════════════════
     st.markdown('<div style="margin:2rem 0 0.5rem;"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-pill">Detail</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-pill">📋  Detail</div>', unsafe_allow_html=True)
     st.markdown('<div style="margin-bottom:0.75rem;"></div>', unsafe_allow_html=True)
 
     tab_ov, tab_brs, tab_matched, tab_near, tab_comp, tab_me, tab_exc, tab_exp = st.tabs([
@@ -1164,7 +1366,7 @@ if 'results' in st.session_state:
 
         if not carry_fwd.empty:
             st.markdown('<div style="margin-top:2rem;"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="section-pill">Carry-Forward Items</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-pill">⏩  Carry-Forward Items</div>', unsafe_allow_html=True)
             st.markdown(f"""
             <div style="color:#64748b;font-size:0.8rem;margin:0.5rem 0 0.8rem;">
                 {len(carry_fwd)} items carry forward to next period (all non-cleared statuses).
@@ -1247,7 +1449,7 @@ if 'results' in st.session_state:
                 No split / part-payment matches found.<br>
                 <span style="font-size:0.75rem;">
                   All transactions reconcile 1-to-1. Enable split matching
-                  in the sidebar if you expect part-payments.
+                  in Settings (Advanced Mode) if you expect part-payments.
                 </span>
             </div>""", unsafe_allow_html=True)
 
@@ -1377,17 +1579,29 @@ if 'results' in st.session_state:
             )
 
 else:
-    st.markdown("""
-    <div style="text-align:center;padding:3.5rem 2rem;
-                background:rgba(30,41,59,0.4);
-                border:1px dashed rgba(59,130,246,0.25);
-                border-radius:16px;margin-top:1.5rem;
-                color:#475569;font-size:0.9rem;">
-        <div style="font-size:2rem;margin-bottom:0.75rem;opacity:0.5;">⬡</div>
-        Upload both files and click
-        <strong style="color:#a5b4fc;">Run Reconciliation</strong> to begin.
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        '<div style="text-align:center;padding:4rem 2rem;margin-top:2rem;'
+        'background:rgba(17,24,39,0.55);border:1.5px dashed rgba(59,130,246,0.2);'
+        'border-radius:20px;backdrop-filter:blur(10px);">'
+        '<div style="font-size:2.8rem;margin-bottom:1rem;'
+        'filter:drop-shadow(0 0 12px rgba(99,102,241,0.35));">⬡</div>'
+        '<div style="font-size:1.05rem;font-weight:600;color:#94a3b8;margin-bottom:0.5rem;">'
+        'Ready to reconcile</div>'
+        '<div style="font-size:0.82rem;color:#475569;line-height:1.7;max-width:400px;margin:0 auto;">'
+        'Upload your <span style="color:#a5b4fc;font-weight:600;">Bank Statement</span>'
+        ' and <span style="color:#a5b4fc;font-weight:600;">Ledger / Cashbook</span> above,'
+        ' then click <strong style="color:#3B82F6;">Run Reconciliation</strong> to begin.'
+        '</div>'
+        '<div style="display:flex;justify-content:center;gap:2rem;margin-top:1.8rem;'
+        'font-size:0.72rem;color:#334155;font-weight:600;letter-spacing:0.04em;">'
+        '<span>✦ 4-Pass Matching</span>'
+        '<span>✦ BRS Statement</span>'
+        '<span>✦ Month-End View</span>'
+        '<span>✦ Excel Export</span>'
+        '</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ══════════════════════════════════════════════

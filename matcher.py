@@ -15,6 +15,7 @@ Additional features:
 """
 
 import re
+import time
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
@@ -500,12 +501,18 @@ def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
     if config is None:
         config = MatchConfig()
 
+    _t_start = time.perf_counter()
+
     bank   = standardize_bank(bank_df)
     ledger = standardize_ledger(ledger_df)
 
     # Pre-compute base-currency amounts once per row (uses description-embedded FX rates)
     bank   = _enrich_amounts(bank,   config)
     ledger = _enrich_amounts(ledger, config)
+
+    _t_prep = time.perf_counter()
+    print(f"[LedgerSync] Standardize + enrich: {_t_prep - _t_start:.3f}s  "
+          f"bank={len(bank)} ledger={len(ledger)}")
 
     # Auto-enable account weight when both sides have account data
     has_account = (
@@ -546,6 +553,9 @@ def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
             used_bank.add(t.Index)
             used_ledger.add(l_idx)
 
+    _t_p1 = time.perf_counter()
+    print(f"[LedgerSync] Pass 1 (exact):  {_t_p1 - _t_prep:.3f}s  matches={len(matched)}")
+
     # ── Pass 2: Near-match 1-to-1 ─────────────────────────────────────────
     # Dynamic performance thresholds
     skip_near      = len(bank) > 4000
@@ -560,6 +570,11 @@ def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
                 continue
             _ledger_amt_idx.setdefault(round(float(t.amount_base), 0), []).append(t.Index)
 
+        # Pre-materialise ledger rows as a dict of Series so the inner loop uses
+        # a plain Python dict lookup instead of a pandas .loc call on each candidate.
+        # dict(iterrows()) is O(n) and runs once; subsequent access is O(1).
+        _ledger_row_cache: dict = dict(ledger.iterrows())
+
         for t in bank.itertuples():
             if t.Index in used_bank:
                 continue
@@ -568,22 +583,30 @@ def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
             l_idxs = [i for i in _ledger_amt_idx.get(b_key, []) if i not in used_ledger]
 
             best_conf, best_l, best_l_idx = 0.0, None, None
+
+            # Fetch b_row ONCE per bank row — previously it was re-fetched
+            # via bank.loc[t.Index] on every inner-loop iteration (wasteful).
+            b_row = bank.loc[t.Index]
+
             for l_idx in l_idxs:
-                l_row = ledger.loc[l_idx]
+                l_row = _ledger_row_cache[l_idx]          # dict lookup, no pandas overhead
                 diff  = abs(b_base - float(l_row['amount_base']))
                 if diff > config.amount_tolerance_abs:
                     if (config.amount_tolerance_pct == 0
                             or diff > abs(b_base) * config.amount_tolerance_pct):
                         continue
-                b_row = bank.loc[t.Index]
                 conf  = _confidence(b_row, l_row, config, has_account)
                 if conf >= 0.50 and conf > best_conf:
                     best_conf, best_l, best_l_idx = conf, l_row, l_idx
 
             if best_l is not None:
-                near_matched.append(_build_match_row(bank.loc[t.Index], best_l, best_conf, 'NEAR'))
+                near_matched.append(_build_match_row(b_row, best_l, best_conf, 'NEAR'))
                 used_bank.add(t.Index)
                 used_ledger.add(best_l_idx)
+
+    _t_p2 = time.perf_counter()
+    print(f"[LedgerSync] Pass 2 (near):   {_t_p2 - _t_p1:.3f}s  "
+          f"matches={len(near_matched)}  skipped={skip_near}")
 
     # ── Pass 3: Composite 1-to-N ──────────────────────────────────────────
     # rem_l is computed ONCE before the loop, then refreshed only when a match
@@ -622,6 +645,10 @@ def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
                 hit_idxs = {bi for bi, _ in result}
                 used_bank.update(hit_idxs)
                 rem_b = rem_b[~rem_b.index.isin(hit_idxs)]  # update only on match
+
+    _t_p34 = time.perf_counter()
+    print(f"[LedgerSync] Pass 3+4 (composite): {_t_p34 - _t_p2:.3f}s  "
+          f"matches={len(composite)}  skipped={skip_composite}")
 
     # ── Collect unmatched ─────────────────────────────────────────────────
     unmatched_bank   = bank[~bank.index.isin(used_bank)].copy()
@@ -662,6 +689,11 @@ def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
                           or ledger['currency'].notna().any()),
         'base_currency': config.base_currency,
     }
+
+    print(f"[LedgerSync] reconcile() TOTAL: {time.perf_counter() - _t_start:.3f}s  "
+          f"match_rate={summary['match_rate']}%  "
+          f"unmatched_bank={summary['unmatched_bank']}  "
+          f"unmatched_ledger={summary['unmatched_ledger']}")
 
     return {
         'matched':          matched_df,
