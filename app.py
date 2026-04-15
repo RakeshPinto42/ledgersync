@@ -1,9 +1,10 @@
 """
-XBP LedgerSync — Bank Reconciliation Tool
+LedgerSync — Bank Reconciliation Tool
 Run: streamlit run app.py
 """
 
 import io
+import html as _html
 import streamlit as st
 import pandas as pd
 from matcher import reconcile, MatchConfig
@@ -11,7 +12,7 @@ from month_end import generate_month_end_recon
 
 # ── Page Config ──
 st.set_page_config(
-    page_title="XBP LedgerSync",
+    page_title="LedgerSync",
     page_icon="⬡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -26,20 +27,19 @@ st.markdown("""
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 .stApp {
-    background: #0f172a;
+    background: #0A1A2F;
     background-image:
-        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(99,102,241,0.15) 0%, transparent 60%),
-        radial-gradient(ellipse 60% 40% at 80% 80%, rgba(139,92,246,0.08) 0%, transparent 50%);
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(59,130,246,0.12) 0%, transparent 60%);
 }
 #MainMenu, footer, header { visibility: hidden; }
 .block-container { padding-top: 1.5rem; padding-bottom: 3rem; }
 
 [data-testid="stSidebar"] {
     background: rgba(15,23,42,0.95) !important;
-    border-right: 1px solid rgba(99,102,241,0.2);
+    border-right: 1px solid rgba(59,130,246,0.2);
 }
 [data-testid="stSidebar"] .stSlider > div > div > div {
-    background: linear-gradient(90deg,#6366f1,#8b5cf6) !important;
+    background: linear-gradient(90deg,#3B82F6,#1D4ED8) !important;
 }
 [data-testid="stSidebar"] label,
 [data-testid="stSidebar"] p,
@@ -50,7 +50,7 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 /* sidebar divider */
 [data-testid="stSidebar"] hr {
-    border-color: rgba(99,102,241,0.15) !important;
+    border-color: rgba(59,130,246,0.15) !important;
     margin: 0.6rem 0 !important;
 }
 /* sidebar caption — used as section labels */
@@ -71,20 +71,20 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 }
 
 h1,h2,h3,h4,h5,h6,p,label,.stMarkdown { color: #e2e8f0; }
-hr { border-color: rgba(99,102,241,0.2) !important; }
+hr { border-color: rgba(59,130,246,0.2) !important; }
 
 /* inputs */
 [data-testid="stNumberInput"] input,
 [data-testid="stTextInput"] input,
 [data-testid="stTextArea"] textarea {
     background: rgba(30,41,59,0.7) !important;
-    border: 1px solid rgba(99,102,241,0.3) !important;
+    border: 1px solid rgba(59,130,246,0.3) !important;
     border-radius: 8px !important;
     color: #e2e8f0 !important;
 }
 [data-testid="stSelectbox"] > div > div {
     background: rgba(30,41,59,0.7) !important;
-    border: 1px solid rgba(99,102,241,0.25) !important;
+    border: 1px solid rgba(59,130,246,0.25) !important;
     border-radius: 8px !important;
     color: #e2e8f0 !important;
 }
@@ -95,46 +95,46 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
 /* upload */
 [data-testid="stFileUploader"] {
     background: rgba(30,41,59,0.6) !important;
-    border: 1px dashed rgba(99,102,241,0.4) !important;
+    border: 1px dashed rgba(59,130,246,0.4) !important;
     border-radius: 12px !important;
     padding: 1rem !important;
     backdrop-filter: blur(8px);
 }
-[data-testid="stFileUploader"]:hover { border-color: rgba(99,102,241,0.8) !important; }
+[data-testid="stFileUploader"]:hover { border-color: rgba(59,130,246,0.8) !important; }
 [data-testid="stFileUploader"] * { color: #cbd5e1 !important; }
 
 /* primary button */
 .stButton > button[kind="primary"] {
-    background: linear-gradient(135deg,#6366f1 0%,#8b5cf6 100%) !important;
+    background: linear-gradient(135deg,#3B82F6 0%,#1D4ED8 100%) !important;
     color: white !important;
     border: none !important;
     border-radius: 10px !important;
     font-weight: 600 !important;
     font-size: 0.95rem !important;
     padding: 0.65rem 1.5rem !important;
-    box-shadow: 0 4px 20px rgba(99,102,241,0.35) !important;
+    box-shadow: 0 4px 20px rgba(59,130,246,0.35) !important;
     transition: box-shadow 0.2s ease, transform 0.1s ease !important;
 }
 .stButton > button[kind="primary"]:hover {
-    box-shadow: 0 6px 28px rgba(99,102,241,0.55) !important;
+    box-shadow: 0 6px 28px rgba(59,130,246,0.55) !important;
     transform: translateY(-1px) !important;
 }
 .stButton > button, .stDownloadButton > button {
     background: rgba(30,41,59,0.7) !important;
     color: #e2e8f0 !important;
-    border: 1px solid rgba(99,102,241,0.3) !important;
+    border: 1px solid rgba(59,130,246,0.3) !important;
     border-radius: 10px !important;
     font-weight: 500 !important;
 }
 .stButton > button:hover, .stDownloadButton > button:hover {
-    background: rgba(99,102,241,0.15) !important;
-    border-color: rgba(99,102,241,0.6) !important;
+    background: rgba(59,130,246,0.15) !important;
+    border-color: rgba(59,130,246,0.6) !important;
 }
 
 /* tabs */
 .stTabs [data-baseweb="tab-list"] {
     background: transparent !important;
-    border-bottom: 1px solid rgba(99,102,241,0.2) !important;
+    border-bottom: 1px solid rgba(59,130,246,0.2) !important;
     gap: 0.2rem;
 }
 .stTabs [data-baseweb="tab"] {
@@ -146,17 +146,17 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
     font-weight: 500 !important;
     padding: 0.45rem 0.8rem !important;
 }
-.stTabs [data-baseweb="tab"]:hover { color: #a5b4fc !important; background: rgba(99,102,241,0.08) !important; }
+.stTabs [data-baseweb="tab"]:hover { color: #a5b4fc !important; background: rgba(59,130,246,0.08) !important; }
 .stTabs [aria-selected="true"] {
     color: #a5b4fc !important;
-    background: rgba(99,102,241,0.12) !important;
-    border-bottom: 2px solid #6366f1 !important;
+    background: rgba(59,130,246,0.12) !important;
+    border-bottom: 2px solid #3B82F6 !important;
 }
 
 /* dataframes */
 .stDataFrame,[data-testid="stDataFrame"] {
     background: rgba(15,23,42,0.8) !important;
-    border: 1px solid rgba(99,102,241,0.2) !important;
+    border: 1px solid rgba(59,130,246,0.2) !important;
     border-radius: 12px !important;
     overflow: hidden;
 }
@@ -164,13 +164,13 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
 /* expanders */
 .streamlit-expanderHeader {
     background: rgba(30,41,59,0.5) !important;
-    border: 1px solid rgba(99,102,241,0.2) !important;
+    border: 1px solid rgba(59,130,246,0.2) !important;
     border-radius: 10px !important;
     color: #94a3b8 !important;
 }
 .streamlit-expanderContent {
     background: rgba(15,23,42,0.6) !important;
-    border: 1px solid rgba(99,102,241,0.15) !important;
+    border: 1px solid rgba(59,130,246,0.15) !important;
     border-top: none !important;
     border-radius: 0 0 10px 10px !important;
 }
@@ -178,14 +178,14 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
 .stAlert {
     background: rgba(30,41,59,0.7) !important;
     border-radius: 10px !important;
-    border: 1px solid rgba(99,102,241,0.25) !important;
+    border: 1px solid rgba(59,130,246,0.25) !important;
 }
-.stSpinner > div { border-top-color: #6366f1 !important; }
+.stSpinner > div { border-top-color: #3B82F6 !important; }
 
 /* ── KPI cards ── */
 .kpi-card {
     background: rgba(30,41,59,0.55);
-    border: 1px solid rgba(99,102,241,0.25);
+    border: 1px solid rgba(59,130,246,0.25);
     border-radius: 16px;
     padding: 1.4rem 1.5rem 1.2rem;
     backdrop-filter: blur(12px);
@@ -195,12 +195,12 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
 }
 .kpi-card::before {
     content:''; position:absolute; top:0;left:0;right:0; height:2px;
-    background: linear-gradient(90deg,#6366f1,#8b5cf6,transparent);
+    background: linear-gradient(90deg,#3B82F6,#1D4ED8,transparent);
     border-radius: 16px 16px 0 0;
 }
 .kpi-card:hover {
-    border-color: rgba(99,102,241,0.5);
-    box-shadow: 0 8px 32px rgba(99,102,241,0.2),inset 0 1px 0 rgba(255,255,255,0.07);
+    border-color: rgba(59,130,246,0.5);
+    box-shadow: 0 8px 32px rgba(59,130,246,0.2),inset 0 1px 0 rgba(255,255,255,0.07);
 }
 .kpi-label { font-size:0.68rem;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#64748b;margin-bottom:0.6rem; }
 .kpi-value { font-size:2rem;font-weight:700;line-height:1;
@@ -211,8 +211,8 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
 
 /* ── Pill ── */
 .section-pill {
-    display:inline-block;background:rgba(99,102,241,0.12);
-    border:1px solid rgba(99,102,241,0.3);border-radius:20px;
+    display:inline-block;background:rgba(59,130,246,0.12);
+    border:1px solid rgba(59,130,246,0.3);border-radius:20px;
     padding:0.2rem 0.8rem;font-size:0.68rem;font-weight:600;
     letter-spacing:0.08em;text-transform:uppercase;color:#a5b4fc;margin-bottom:0.5rem;
 }
@@ -225,15 +225,15 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
 
 /* ── Mapper card ── */
 .mapper-card {
-    background:rgba(30,41,59,0.5);border:1px solid rgba(99,102,241,0.22);
+    background:rgba(30,41,59,0.5);border:1px solid rgba(59,130,246,0.22);
     border-radius:14px;padding:1.2rem 1.4rem;backdrop-filter:blur(10px);
 }
-.mapper-title { font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#6366f1;margin-bottom:0.8rem; }
+.mapper-title { font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#3B82F6;margin-bottom:0.8rem; }
 
 /* ── BRS ── */
 .brs-wrap {
     background: rgba(30,41,59,0.5);
-    border: 1px solid rgba(99,102,241,0.22);
+    border: 1px solid rgba(59,130,246,0.22);
     border-radius: 16px;
     padding: 1.8rem 2rem;
     backdrop-filter: blur(12px);
@@ -256,7 +256,7 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
     display: flex;
     justify-content: space-between;
     padding: 0.5rem 0 0.5rem;
-    border-bottom: 1px solid rgba(99,102,241,0.3);
+    border-bottom: 1px solid rgba(59,130,246,0.3);
     margin: 1rem 0 0.1rem;
 }
 .brs-col-header span {
@@ -275,7 +275,7 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
     justify-content: space-between;
     align-items: baseline;
     padding: 0.5rem 0;
-    border-bottom: 1px solid rgba(99,102,241,0.07);
+    border-bottom: 1px solid rgba(59,130,246,0.07);
     font-size: 0.86rem;
 }
 .brs-row-label { color: #94a3b8; flex: 1; padding-right: 1rem; }
@@ -298,14 +298,14 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
     font-variant-numeric: tabular-nums;
     font-size: 0.9rem;
 }
-.brs-divider  { border: none; border-top: 1px solid rgba(99,102,241,0.22); margin: 0.5rem 0; }
+.brs-divider  { border: none; border-top: 1px solid rgba(59,130,246,0.22); margin: 0.5rem 0; }
 .brs-total-row {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
     padding: 0.65rem 0.75rem;
-    background: rgba(99,102,241,0.09);
-    border: 1px solid rgba(99,102,241,0.18);
+    background: rgba(59,130,246,0.09);
+    border: 1px solid rgba(59,130,246,0.18);
     border-radius: 8px;
     margin: 0.35rem 0;
     font-size: 0.9rem;
@@ -320,8 +320,8 @@ hr { border-color: rgba(99,102,241,0.2) !important; }
 /* ── footer ── */
 .xbp-footer { text-align:center;color:#334155;font-size:0.72rem;
     letter-spacing:0.06em;padding:2.5rem 0 1rem;
-    border-top:1px solid rgba(99,102,241,0.1);margin-top:3rem; }
-.xbp-footer span { background:linear-gradient(90deg,#6366f1,#8b5cf6);
+    border-top:1px solid rgba(59,130,246,0.1);margin-top:3rem; }
+.xbp-footer span { background:linear-gradient(90deg,#3B82F6,#1D4ED8);
     -webkit-background-clip:text;-webkit-text-fill-color:transparent;
     background-clip:text;font-weight:600; }
 </style>
@@ -497,8 +497,11 @@ def _render_brs(summary: dict, results: dict, period_label: str, opening_balance
     ccy = summary.get('base_currency', 'INR')
 
     def _fmt(v):
-        sym = '₹' if ccy == 'INR' else f'{ccy} '
-        return f"{sym}{v:,.2f}"
+        try:
+            sym = '₹' if ccy == 'INR' else f'{ccy} '
+            return f"{sym}{float(v):,.2f}"
+        except (TypeError, ValueError):
+            return '—'
 
     diff_class = "brs-diff-zero" if abs(recon_diff) < 0.01 else "brs-diff-nonzero"
     diff_note  = "Fully reconciled" if abs(recon_diff) < 0.01 else "Residual — review near/composite matches"
@@ -506,70 +509,85 @@ def _render_brs(summary: dict, results: dict, period_label: str, opening_balance
     nb_count = summary['unmatched_bank']
     nl_count = summary['unmatched_ledger']
 
-    st.markdown(f"""
-    <div class="brs-wrap">
-        <div class="brs-title">Bank Reconciliation Statement</div>
-        <div class="brs-subtitle">
-            Period: {period_label} &nbsp;·&nbsp;
-            Prepared: {pd.Timestamp.today().strftime('%d %b %Y')} &nbsp;·&nbsp;
-            Base currency: {ccy}
-        </div>
+    # HTML-escape all user-provided strings to prevent broken markup
+    safe_period   = _html.escape(str(period_label))
+    safe_ccy      = _html.escape(str(ccy))
+    safe_prepared = _html.escape(pd.Timestamp.today().strftime('%d %b %Y'))
+    safe_note     = _html.escape(diff_note)
 
-        <div class="brs-col-header">
-            <span>Particulars</span>
-            <span>Amount ({ccy})</span>
-        </div>
+    # Build HTML as a variable — then render with st.markdown once.
+    # Splitting into a string first avoids f-string interaction with any
+    # special characters the user may have typed in the period field.
+    brs_html = (
+        '<div class="brs-wrap">'
+        '<div class="brs-title">Bank Reconciliation Statement</div>'
+        f'<div class="brs-subtitle">'
+        f'Period: {safe_period} &nbsp;·&nbsp; '
+        f'Prepared: {safe_prepared} &nbsp;·&nbsp; '
+        f'Base currency: {safe_ccy}'
+        f'</div>'
 
-        <div class="brs-row">
-            <span class="brs-row-label">Opening Balance as per Books (Ledger)</span>
-            <span class="brs-row-amt">{_fmt(opening_balance)}</span>
-        </div>
-        <div class="brs-row">
-            <span class="brs-row-label">Balance as per Bank Statement (closing)</span>
-            <span class="brs-row-amt">{_fmt(bank_bal)}</span>
-        </div>
+        '<div class="brs-col-header">'
+        '<span>Particulars</span>'
+        f'<span>Amount ({safe_ccy})</span>'
+        '</div>'
 
-        <hr class="brs-divider">
+        '<div class="brs-row">'
+        '<span class="brs-row-label">Opening Balance as per Books (Ledger)</span>'
+        f'<span class="brs-row-amt">{_fmt(opening_balance)}</span>'
+        '</div>'
 
-        <div class="brs-row">
-            <span class="brs-row-label">
-                <span class="brs-tag brs-tag-add">ADD</span>
-                Outstanding Ledger / ERP Entries
-                <span class="brs-note">({nl_count} items — booked, not yet cleared by bank)</span>
-            </span>
-            <span class="brs-row-amt">+ {_fmt(unmatched_ledger_amt)}</span>
-        </div>
-        <div class="brs-row">
-            <span class="brs-row-label">
-                <span class="brs-tag brs-tag-less">LESS</span>
-                Unrecorded Bank Entries
-                <span class="brs-note">({nb_count} items — in bank statement, not yet posted)</span>
-            </span>
-            <span class="brs-row-amt">− {_fmt(unmatched_bank_amt)}</span>
-        </div>
+        '<div class="brs-row">'
+        '<span class="brs-row-label">Balance as per Bank Statement (closing)</span>'
+        f'<span class="brs-row-amt">{_fmt(bank_bal)}</span>'
+        '</div>'
 
-        <hr class="brs-divider">
+        '<hr class="brs-divider">'
 
-        <div class="brs-total-row">
-            <span class="brs-total-label">Adjusted Bank Balance</span>
-            <span class="brs-total-amt">{_fmt(adjusted_bank)}</span>
-        </div>
-        <div class="brs-row" style="margin-top:0.5rem;">
-            <span class="brs-row-label">Balance as per Books / Ledger</span>
-            <span class="brs-row-amt">{_fmt(ledger_bal)}</span>
-        </div>
+        '<div class="brs-row">'
+        '<span class="brs-row-label">'
+        '<span class="brs-tag brs-tag-add">ADD</span>'
+        f'Outstanding Ledger / ERP Entries '
+        f'<span class="brs-note">({nl_count} items — booked, not yet cleared by bank)</span>'
+        '</span>'
+        f'<span class="brs-row-amt">+ {_fmt(unmatched_ledger_amt)}</span>'
+        '</div>'
 
-        <hr class="brs-divider">
+        '<div class="brs-row">'
+        '<span class="brs-row-label">'
+        '<span class="brs-tag brs-tag-less">LESS</span>'
+        f'Unrecorded Bank Entries '
+        f'<span class="brs-note">({nb_count} items — in bank statement, not yet posted)</span>'
+        '</span>'
+        f'<span class="brs-row-amt">&#8722; {_fmt(unmatched_bank_amt)}</span>'
+        '</div>'
 
-        <div class="brs-total-row">
-            <span class="brs-total-label {diff_class}">
-                Net Difference &nbsp;
-                <span style="font-size:0.7rem;font-weight:400;color:#475569;">{diff_note}</span>
-            </span>
-            <span class="brs-total-amt {diff_class}">{_fmt(recon_diff)}</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        '<hr class="brs-divider">'
+
+        '<div class="brs-total-row">'
+        '<span class="brs-total-label">Adjusted Bank Balance</span>'
+        f'<span class="brs-total-amt">{_fmt(adjusted_bank)}</span>'
+        '</div>'
+
+        '<div class="brs-row" style="margin-top:0.5rem;">'
+        '<span class="brs-row-label">Balance as per Books / Ledger</span>'
+        f'<span class="brs-row-amt">{_fmt(ledger_bal)}</span>'
+        '</div>'
+
+        '<hr class="brs-divider">'
+
+        f'<div class="brs-total-row">'
+        f'<span class="brs-total-label {diff_class}">'
+        f'Net Difference &nbsp;'
+        f'<span style="font-size:0.7rem;font-weight:400;color:#475569;">{safe_note}</span>'
+        f'</span>'
+        f'<span class="brs-total-amt {diff_class}">{_fmt(recon_diff)}</span>'
+        '</div>'
+
+        '</div>'
+    )
+
+    st.markdown(brs_html, unsafe_allow_html=True)
 
 
 def _per_account_summary(results: dict) -> pd.DataFrame | None:
@@ -693,18 +711,12 @@ def _combine_account_results(per_account: dict) -> dict:
 # ══════════════════════════════════════════════
 st.markdown("""
 <div style="text-align:center;padding:2rem 0 1.8rem;">
-    <div style="font-size:0.72rem;font-weight:700;letter-spacing:0.15em;
-                text-transform:uppercase;color:#6366f1;margin-bottom:0.75rem;">
-        XBP GLOBAL &nbsp;·&nbsp; FINANCIAL INTELLIGENCE
-    </div>
     <h1 style="font-size:3rem;font-weight:700;letter-spacing:-0.03em;margin:0;
-               background:linear-gradient(135deg,#e2e8f0 0%,#a5b4fc 50%,#8b5cf6 100%);
-               -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-               background-clip:text;line-height:1.1;">
-        XBP LedgerSync
+               color:#F1F5F9;line-height:1.1;">
+        LedgerSync
     </h1>
-    <p style="font-size:1rem;color:#64748b;font-weight:400;margin-top:0.6rem;
-              letter-spacing:0.02em;">Reconciliation. Simplified.</p>
+    <p style="font-size:0.82rem;color:#64748b;font-weight:400;margin-top:0.4rem;
+              letter-spacing:0.02em;">by R@k</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -716,13 +728,12 @@ with st.sidebar:
 
     # ── Branding ──────────────────────────────
     st.markdown("""
-    <div style="padding:0.25rem 0 1rem;border-bottom:1px solid rgba(99,102,241,0.2);margin-bottom:0.75rem;">
-        <div style="font-size:0.62rem;letter-spacing:0.12em;text-transform:uppercase;
-                    color:#475569;margin-bottom:0.2rem;">XBP GLOBAL</div>
+    <div style="padding:0.25rem 0 1rem;border-bottom:1px solid rgba(59,130,246,0.2);margin-bottom:0.75rem;">
         <div style="font-size:1.1rem;font-weight:700;
-                    background:linear-gradient(90deg,#a5b4fc,#8b5cf6);
+                    background:linear-gradient(90deg,#a5b4fc,#1D4ED8);
                     -webkit-background-clip:text;-webkit-text-fill-color:transparent;
                     background-clip:text;">LedgerSync</div>
+        <div style="font-size:0.62rem;color:#475569;margin-top:0.15rem;">by R@k</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -821,7 +832,7 @@ with st.sidebar:
     if advanced_mode:
         st.markdown(
             f"<div style='font-size:0.72rem;color:#475569;line-height:1.9;'>"
-            f"<span style='color:#6366f1;font-weight:600;font-size:0.63rem;"
+            f"<span style='color:#3B82F6;font-weight:600;font-size:0.63rem;"
             f"letter-spacing:0.06em;'>ACTIVE CONFIG</span><br>"
             f"Date tol: <span style='color:#a5b4fc;'>{date_tolerance}d</span> &nbsp;·&nbsp; "
             f"Base: <span style='color:#a5b4fc;'>{base_currency}</span><br>"
@@ -833,7 +844,7 @@ with st.sidebar:
     else:
         st.markdown(
             "<div style='font-size:0.72rem;color:#475569;line-height:1.9;'>"
-            "<span style='color:#6366f1;font-weight:600;font-size:0.63rem;"
+            "<span style='color:#3B82F6;font-weight:600;font-size:0.63rem;"
             "letter-spacing:0.06em;'>AUTO MODE</span><br>"
             "✅ Smart defaults applied<br>"
             "✅ Composite matching on<br>"
@@ -879,7 +890,7 @@ if bank_file and ledger_file:
     st.markdown("""
     <div style="color:#64748b;font-size:0.8rem;margin-bottom:0.9rem;">
         Map your file columns to the required fields. Fields marked
-        <span style="color:#6366f1;">*</span> are required.
+        <span style="color:#3B82F6;">*</span> are required.
         Columns are auto-detected where possible — confirm before running.
     </div>""", unsafe_allow_html=True)
 
@@ -928,6 +939,9 @@ if bank_file and ledger_file:
         )
 
         with st.spinner("Analysing transactions…"):
+            if len(bank_df) > 2000:
+                config.composite_match = False
+
             results   = reconcile(bank_df, ledger_df, config)
             month_end = generate_month_end_recon(results, opening_ledger_balance=opening_balance)
 
@@ -1060,7 +1074,7 @@ if 'results' in st.session_state:
         ov1, ov2 = st.columns(2, gap="large")
         with ov1:
             st.markdown(f"""
-            <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(99,102,241,0.2);
+            <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(59,130,246,0.2);
                         border-radius:12px;padding:1.2rem;">
                 <div class="kpi-label" style="margin-bottom:0.8rem;">Match Breakdown</div>
                 <div class="brs-row">
@@ -1097,15 +1111,15 @@ if 'results' in st.session_state:
                 feat_rows += f'<div style="font-size:0.75rem;color:#c084fc;margin-bottom:0.3rem;">{composites} split / part-payment group(s) found</div>'
 
             st.markdown(f"""
-            <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(99,102,241,0.2);
+            <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(59,130,246,0.2);
                         border-radius:12px;padding:1.2rem;">
                 <div class="kpi-label" style="margin-bottom:1rem;">Match Rate</div>
                 <div style="font-size:2.5rem;font-weight:700;
-                            background:linear-gradient(135deg,#34d399,#6366f1);
+                            background:linear-gradient(135deg,#34d399,#3B82F6);
                             -webkit-background-clip:text;-webkit-text-fill-color:transparent;
                             background-clip:text;margin-bottom:0.8rem;">{rate}%</div>
                 <div style="background:rgba(15,23,42,0.8);border-radius:100px;height:6px;overflow:hidden;">
-                    <div style="width:{bar_w}%;height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);border-radius:100px;"></div>
+                    <div style="width:{bar_w}%;height:100%;background:linear-gradient(90deg,#3B82F6,#1D4ED8);border-radius:100px;"></div>
                 </div>
                 <div style="font-size:0.72rem;color:#475569;margin-top:0.5rem;">
                     {summary['exact_matches'] + summary['near_matches'] + composites} of {total_txns} bank entries matched
@@ -1135,7 +1149,7 @@ if 'results' in st.session_state:
                 col = STATUS_COLORS.get(status, '#94a3b8')
                 with s_cols[i % 5]:
                     st.markdown(f"""
-                    <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(99,102,241,0.18);
+                    <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(59,130,246,0.18);
                                 border-radius:10px;padding:0.7rem 0.8rem;text-align:center;margin-bottom:0.5rem;">
                         <div style="font-size:1.3rem;font-weight:700;color:{col};">{cnt}</div>
                         <div style="font-size:0.6rem;color:#475569;margin-top:0.2rem;letter-spacing:0.04em;">
@@ -1278,7 +1292,7 @@ if 'results' in st.session_state:
                     color = AGING_COLORS.get(bucket, '#94a3b8')
                     with ag_cols[i]:
                         st.markdown(f"""
-                        <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(99,102,241,0.18);
+                        <div style="background:rgba(30,41,59,0.5);border:1px solid rgba(59,130,246,0.18);
                                     border-radius:10px;padding:0.7rem;text-align:center;">
                             <div style="font-size:1.3rem;font-weight:700;color:{color};">{cnt}</div>
                             <div style="font-size:0.65rem;color:#475569;margin-top:0.2rem;">
@@ -1357,7 +1371,7 @@ if 'results' in st.session_state:
             st.download_button(
                 label="Download Full Report (.xlsx)",
                 data=buffer.getvalue(),
-                file_name=f"xbp_ledgersync_{period_lbl.replace(' ','_').lower()}.xlsx",
+                file_name=f"ledgersync_{period_lbl.replace(' ','_').lower()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
@@ -1366,7 +1380,7 @@ else:
     st.markdown("""
     <div style="text-align:center;padding:3.5rem 2rem;
                 background:rgba(30,41,59,0.4);
-                border:1px dashed rgba(99,102,241,0.25);
+                border:1px dashed rgba(59,130,246,0.25);
                 border-radius:16px;margin-top:1.5rem;
                 color:#475569;font-size:0.9rem;">
         <div style="font-size:2rem;margin-bottom:0.75rem;opacity:0.5;">⬡</div>
@@ -1381,6 +1395,6 @@ else:
 # ══════════════════════════════════════════════
 st.markdown("""
 <div class="xbp-footer">
-    &copy; <span>XBP Global</span> &nbsp;—&nbsp; LedgerSync &nbsp;·&nbsp; All rights reserved
+    LedgerSync &nbsp;·&nbsp; <span>by R@k</span>
 </div>
 """, unsafe_allow_html=True)

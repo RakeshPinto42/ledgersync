@@ -1,5 +1,5 @@
 """
-XBP LedgerSync — Matching Engine
+LedgerSync — Matching Engine
 Reconciles bank transactions against ledger entries using 4 passes:
 
   Pass 1  — Exact / high-confidence 1-to-1
@@ -14,6 +14,7 @@ Additional features:
   • Absolute + percentage amount tolerance
 """
 
+import re
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
@@ -53,7 +54,7 @@ class MatchConfig:
 
     # Composite matching
     composite_match: bool        = True
-    composite_max_items: int     = 5    # max items in one composite group
+    composite_max_items: int     = 2    # max items in one composite group
     composite_date_slack: int    = 14   # days window for composite candidates
 
 
@@ -73,6 +74,109 @@ def _to_base(amount: float, currency, config: MatchConfig) -> float:
     if rate and rate > 0:
         return float(amount) * float(rate)
     return float(amount)   # unknown currency → use as-is
+
+
+# ─── FX rate extraction from descriptions ─────────────────────────────────────
+
+# Matches: "@ 83.25", "@83.25", "RATE 83.50", "RATE:91.20", "EXCH 84.0", "CONV 107.8"
+_FX_RATE_PATTERNS = [
+    re.compile(r'@\s*(\d{1,8}(?:\.\d{1,8})?)', re.IGNORECASE),
+    re.compile(
+        r'(?:RATE|EXCH(?:ANGE)?|CONV(?:ERSION)?)\s*[:\s]\s*(\d{1,8}(?:\.\d{1,8})?)',
+        re.IGNORECASE,
+    ),
+]
+
+
+def extract_fx_rate(description: str) -> 'float | None':
+    """
+    Extract an FX conversion rate embedded in a transaction description.
+
+    Handles patterns like:
+        "USD 100 @ 83.25"    → 83.25
+        "RATE 83.50"          → 83.50
+        "EXCH RATE:91.20"    → 91.20
+        "CONV 107.80"         → 107.80
+
+    Returns the rate as float, or None if not found / implausible.
+    """
+    if not description or pd.isna(description):
+        return None
+    for pat in _FX_RATE_PATTERNS:
+        m = pat.search(str(description))
+        if m:
+            try:
+                rate = float(m.group(1))
+                if 0.000001 < rate < 1_000_000:   # sanity: skip values that look like amounts
+                    return rate
+            except ValueError:
+                pass
+    return None
+
+
+def normalize_amount(amount: float, currency, description: str,
+                     config: 'MatchConfig') -> float:
+    """
+    Convert amount to base currency with description-aware FX rate extraction.
+
+    Lookup priority:
+        1. Rate embedded in description  (e.g. "USD 100 @ 83.25")
+        2. config.fx_rates[currency]
+        3. Amount as-is (unknown currency — no conversion)
+    """
+    if pd.isna(amount):
+        return float('nan')
+    if not currency or pd.isna(currency):
+        return float(amount)
+    ccy  = str(currency).strip().upper()
+    base = config.base_currency.strip().upper()
+    if ccy == base:
+        return float(amount)
+
+    desc_rate = extract_fx_rate(str(description) if description else '')
+    if desc_rate and desc_rate > 0:
+        return float(amount) * desc_rate
+
+    rate = config.fx_rates.get(ccy)
+    if rate and rate > 0:
+        return float(amount) * float(rate)
+
+    return float(amount)   # unknown rate — use as-is
+
+
+def _enrich_amounts(df: pd.DataFrame, config: 'MatchConfig') -> pd.DataFrame:
+    """
+    Pre-compute 'amount_base' (base-currency amount) for every row.
+
+    Vectorized: config-rate multiplication is applied column-wise (one multiply
+    per currency group).  Description-regex is applied only on the 'description'
+    column via Series.map — faster than df.apply(axis=1) because no row-dict is
+    constructed; runs regex per cell on a single string, not a full row object.
+    """
+    df    = df.copy()
+    base  = config.base_currency.strip().upper()
+    amts  = df['amount'].astype(float)
+
+    # Default: amount is already in base currency
+    amount_base = amts.copy()
+
+    # Bulk-multiply by config FX rates (vectorized per-currency group)
+    if config.fx_rates and 'currency' in df.columns:
+        ccy_col      = df['currency'].fillna('').str.upper()
+        mapped_rates = ccy_col.map(config.fx_rates)          # NaN for unknown/base
+        fx_mask = (ccy_col != base) & mapped_rates.notna() & amts.notna()
+        if fx_mask.any():
+            amount_base[fx_mask] = amts[fx_mask] * mapped_rates[fx_mask]
+
+    # Override rows where description contains an embedded FX rate
+    if 'description' in df.columns:
+        desc_rates = df['description'].map(extract_fx_rate)  # single-column map
+        desc_mask  = desc_rates.notna() & amts.notna()
+        if desc_mask.any():
+            amount_base[desc_mask] = amts[desc_mask] * desc_rates[desc_mask]
+
+    df['amount_base'] = amount_base
+    return df
 
 
 # ─── Scoring helpers ──────────────────────────────────────────────────────────
@@ -318,7 +422,11 @@ def _subset_sum_search(target: float, candidates: list,
     cands = candidates[:40]   # safety limit before combinatorics explode
     for size in range(2, min(max_items + 1, len(cands) + 1)):
         for combo in combinations(cands, size):
-            total = sum(float(r['amount']) for _, r in combo)
+            # Use pre-computed base amount when available, fall back to raw amount
+            total = sum(
+                float(r.get('amount_base', r['amount']))
+                for _, r in combo
+            )
             if abs(total - target) <= tol:
                 return list(combo)
     return None
@@ -326,40 +434,49 @@ def _subset_sum_search(target: float, candidates: list,
 
 def _composite_candidates_1_to_n(b_row, unmatched_l: pd.DataFrame,
                                    config: MatchConfig):
-    """Pre-filter ledger candidates for a 1-to-N search."""
-    target = _to_base(b_row['amount'], b_row.get('currency'), config)
-    if pd.isna(target):
+    """
+    Pre-filter ledger candidates for a 1-to-N search.
+    Vectorized: boolean masks on columns instead of row-by-row iterrows.
+    iterrows is only called on the small filtered subset (≤40 rows).
+    """
+    target = float(b_row.get('amount_base', _to_base(b_row['amount'], b_row.get('currency'), config)))
+    if pd.isna(target) or unmatched_l.empty:
         return []
-    tol    = max(config.amount_tolerance_abs,
-                 abs(target) * max(config.amount_tolerance_pct, 0.001))
-    return [
-        (idx, row)
-        for idx, row in unmatched_l.iterrows()
-        if (not pd.isna(row['amount'])
-            and target * row['amount'] >= 0                          # same sign
-            and abs(float(row['amount'])) < abs(target) + tol        # not larger than target
-            and (pd.isna(b_row['date']) or pd.isna(row['date'])
-                 or abs((b_row['date'] - row['date']).days) <= config.composite_date_slack))
-    ]
+    tol = max(config.amount_tolerance_abs,
+              abs(target) * max(config.amount_tolerance_pct, 0.001))
+
+    col  = unmatched_l['amount_base']
+    mask = col.notna() & (col * target >= 0) & (col.abs() < abs(target) + tol)
+
+    if not pd.isna(b_row['date']) and 'date' in unmatched_l.columns:
+        date_diff = (unmatched_l['date'] - b_row['date']).abs()
+        mask &= date_diff.isna() | (date_diff <= pd.Timedelta(days=config.composite_date_slack))
+
+    subset = unmatched_l[mask].head(40)   # combinatorial safety cap
+    return list(subset.iterrows())
 
 
 def _composite_candidates_n_to_1(l_row, unmatched_b: pd.DataFrame,
                                    config: MatchConfig):
-    """Pre-filter bank candidates for an N-to-1 search."""
-    target = _to_base(l_row['amount'], l_row.get('currency'), config)
-    if pd.isna(target):
+    """
+    Pre-filter bank candidates for an N-to-1 search.
+    Vectorized: same approach as _composite_candidates_1_to_n.
+    """
+    target = float(l_row.get('amount_base', _to_base(l_row['amount'], l_row.get('currency'), config)))
+    if pd.isna(target) or unmatched_b.empty:
         return []
-    tol    = max(config.amount_tolerance_abs,
-                 abs(target) * max(config.amount_tolerance_pct, 0.001))
-    return [
-        (idx, row)
-        for idx, row in unmatched_b.iterrows()
-        if (not pd.isna(row['amount'])
-            and target * row['amount'] >= 0
-            and abs(float(row['amount'])) < abs(target) + tol
-            and (pd.isna(l_row['date']) or pd.isna(row['date'])
-                 or abs((l_row['date'] - row['date']).days) <= config.composite_date_slack))
-    ]
+    tol = max(config.amount_tolerance_abs,
+              abs(target) * max(config.amount_tolerance_pct, 0.001))
+
+    col  = unmatched_b['amount_base']
+    mask = col.notna() & (col * target >= 0) & (col.abs() < abs(target) + tol)
+
+    if not pd.isna(l_row['date']) and 'date' in unmatched_b.columns:
+        date_diff = (unmatched_b['date'] - l_row['date']).abs()
+        mask &= date_diff.isna() | (date_diff <= pd.Timedelta(days=config.composite_date_slack))
+
+    subset = unmatched_b[mask].head(40)
+    return list(subset.iterrows())
 
 
 # ─── Main reconcile ───────────────────────────────────────────────────────────
@@ -386,6 +503,10 @@ def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
     bank   = standardize_bank(bank_df)
     ledger = standardize_ledger(ledger_df)
 
+    # Pre-compute base-currency amounts once per row (uses description-embedded FX rates)
+    bank   = _enrich_amounts(bank,   config)
+    ledger = _enrich_amounts(ledger, config)
+
     # Auto-enable account weight when both sides have account data
     has_account = (
         bank['account'].notna().any()
@@ -403,75 +524,104 @@ def reconcile(bank_df: pd.DataFrame, ledger_df: pd.DataFrame,
     used_bank    = set()
     used_ledger  = set()
 
-    # ── Pass 1: Exact / high-confidence 1-to-1 ───────────────────────────
-    for b_idx, b_row in bank.iterrows():
-        if b_idx in used_bank:
+    # ── Pass 1: Exact / fast lookup ───────────────────────────
+    # itertuples ~10x faster than iterrows — no pd.Series constructed per row.
+    # Store only the index in ledger_map; fetch full row via .loc only on a hit.
+
+    ledger_map: dict = {}
+    for t in ledger.itertuples():
+        key = (t.account, t.date, round(float(t.amount_base), 2))
+        ledger_map.setdefault(key, []).append(t.Index)
+
+    for t in bank.itertuples():
+        if t.Index in used_bank:
             continue
-        for l_idx, l_row in ledger.iterrows():
-            if l_idx in used_ledger:
-                continue
-            if not _amount_ok(b_row['amount'], b_row.get('currency'),
-                              l_row['amount'], l_row.get('currency'), config):
-                continue
-            conf = _confidence(b_row, l_row, config, has_account)
-            if conf >= 0.85:
-                matched.append(_build_match_row(b_row, l_row, conf, 'EXACT'))
-                used_bank.add(b_idx)
-                used_ledger.add(l_idx)
-                break
+        key = (t.account, t.date, round(float(t.amount_base), 2))
+        if key in ledger_map and ledger_map[key]:
+            l_idx = ledger_map[key].pop(0)
+            b_row = bank.loc[t.Index]
+            l_row = ledger.loc[l_idx]
+            conf  = _confidence(b_row, l_row, config, has_account)
+            matched.append(_build_match_row(b_row, l_row, conf, 'EXACT'))
+            used_bank.add(t.Index)
+            used_ledger.add(l_idx)
 
     # ── Pass 2: Near-match 1-to-1 ─────────────────────────────────────────
-    for b_idx, b_row in bank.iterrows():
-        if b_idx in used_bank:
-            continue
-        best_conf, best_l, best_l_idx = 0.0, None, None
-        for l_idx, l_row in ledger.iterrows():
-            if l_idx in used_ledger:
+    # Dynamic performance thresholds
+    skip_near      = len(bank) > 4000
+    skip_composite = len(bank) > 2000
+
+    if not skip_near:
+        # Build amount-keyed index (index-only — no full Series stored in dict).
+        # Key = amount_base rounded to nearest integer for O(1) bucket lookup.
+        _ledger_amt_idx: dict = {}
+        for t in ledger.itertuples():
+            if t.Index in used_ledger:
                 continue
-            if not _amount_ok(b_row['amount'], b_row.get('currency'),
-                              l_row['amount'], l_row.get('currency'), config):
+            _ledger_amt_idx.setdefault(round(float(t.amount_base), 0), []).append(t.Index)
+
+        for t in bank.itertuples():
+            if t.Index in used_bank:
                 continue
-            conf = _confidence(b_row, l_row, config, has_account)
-            if conf >= 0.50 and conf > best_conf:
-                best_conf, best_l, best_l_idx = conf, l_row, l_idx
-        if best_l is not None:
-            near_matched.append(_build_match_row(b_row, best_l, best_conf, 'NEAR'))
-            used_bank.add(b_idx)
-            used_ledger.add(best_l_idx)
+            b_base = float(t.amount_base)
+            b_key  = round(b_base, 0)
+            l_idxs = [i for i in _ledger_amt_idx.get(b_key, []) if i not in used_ledger]
+
+            best_conf, best_l, best_l_idx = 0.0, None, None
+            for l_idx in l_idxs:
+                l_row = ledger.loc[l_idx]
+                diff  = abs(b_base - float(l_row['amount_base']))
+                if diff > config.amount_tolerance_abs:
+                    if (config.amount_tolerance_pct == 0
+                            or diff > abs(b_base) * config.amount_tolerance_pct):
+                        continue
+                b_row = bank.loc[t.Index]
+                conf  = _confidence(b_row, l_row, config, has_account)
+                if conf >= 0.50 and conf > best_conf:
+                    best_conf, best_l, best_l_idx = conf, l_row, l_idx
+
+            if best_l is not None:
+                near_matched.append(_build_match_row(bank.loc[t.Index], best_l, best_conf, 'NEAR'))
+                used_bank.add(t.Index)
+                used_ledger.add(best_l_idx)
 
     # ── Pass 3: Composite 1-to-N ──────────────────────────────────────────
-    if config.composite_match and config.composite_max_items >= 2:
+    # rem_l is computed ONCE before the loop, then refreshed only when a match
+    # is found (rare).  Previously it was recomputed every iteration — O(n²).
+    if config.composite_match and not skip_composite:
+        rem_l = ledger[~ledger.index.isin(used_ledger)]
         for b_idx, b_row in bank.iterrows():
             if b_idx in used_bank:
                 continue
-            rem_l    = ledger[~ledger.index.isin(used_ledger)]
-            cands    = _composite_candidates_1_to_n(b_row, rem_l, config)
-            target   = _to_base(b_row['amount'], b_row.get('currency'), config)
-            tol      = max(config.amount_tolerance_abs,
-                           abs(target) * max(config.amount_tolerance_pct, 0.001))
-            result   = _subset_sum_search(target, cands, config.composite_max_items, tol)
+            target = float(b_row['amount_base'])
+            tol    = max(config.amount_tolerance_abs,
+                         abs(target) * max(config.amount_tolerance_pct, 0.001))
+            cands  = _composite_candidates_1_to_n(b_row, rem_l, config)
+            result = _subset_sum_search(target, cands, min(config.composite_max_items, 2), tol)
             if result:
                 composite.append(_build_composite_1_to_n(b_row, result))
                 used_bank.add(b_idx)
-                for l_idx, _ in result:
-                    used_ledger.add(l_idx)
+                hit_idxs = {li for li, _ in result}
+                used_ledger.update(hit_idxs)
+                rem_l = rem_l[~rem_l.index.isin(hit_idxs)]  # update only on match
 
     # ── Pass 4: Composite N-to-1 ──────────────────────────────────────────
-    if config.composite_match and config.composite_max_items >= 2:
+    if config.composite_match and not skip_composite:
+        rem_b = bank[~bank.index.isin(used_bank)]
         for l_idx, l_row in ledger.iterrows():
             if l_idx in used_ledger:
                 continue
-            rem_b    = bank[~bank.index.isin(used_bank)]
-            cands    = _composite_candidates_n_to_1(l_row, rem_b, config)
-            target   = _to_base(l_row['amount'], l_row.get('currency'), config)
-            tol      = max(config.amount_tolerance_abs,
-                           abs(target) * max(config.amount_tolerance_pct, 0.001))
-            result   = _subset_sum_search(target, cands, config.composite_max_items, tol)
+            target = float(l_row['amount_base'])
+            tol    = max(config.amount_tolerance_abs,
+                         abs(target) * max(config.amount_tolerance_pct, 0.001))
+            cands  = _composite_candidates_n_to_1(l_row, rem_b, config)
+            result = _subset_sum_search(target, cands, min(config.composite_max_items, 2), tol)
             if result:
                 composite.append(_build_composite_n_to_1(result, l_row))
                 used_ledger.add(l_idx)
-                for b_idx, _ in result:
-                    used_bank.add(b_idx)
+                hit_idxs = {bi for bi, _ in result}
+                used_bank.update(hit_idxs)
+                rem_b = rem_b[~rem_b.index.isin(hit_idxs)]  # update only on match
 
     # ── Collect unmatched ─────────────────────────────────────────────────
     unmatched_bank   = bank[~bank.index.isin(used_bank)].copy()
